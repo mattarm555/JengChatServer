@@ -48,6 +48,8 @@ const int MAX_STARTING_CHIPS = 1000000;
 const int MAX_POKER_CHIPS = 1000000;
 const int MAX_ROULETTE_ROUNDS = 100;
 const int MAX_ROULETTE_PLAYERS = 6;
+const int MAX_ARENA_PLAYERS = 6;
+const int ARENA_COLOR_COUNT = 16;
 
 
 bool initializeSocketLibrary() {
@@ -246,12 +248,34 @@ struct PokerGame {
     PokerStage stage = PokerStage::PREFLOP;
 };
 
+
+struct ArenaPlayer {
+    Socket socket = INVALID_SOCK;
+    bool ready = false;
+    int colorIndex = -1;
+    int team = -1; // -1 FFA/duel, 0 red, 1 blue
+};
+
+struct ArenaGame {
+    Socket host = INVALID_SOCK;
+    string mode = "SCORE_FFA";
+    int maxPlayers = 4;
+    int scoreLimit = 5;
+    int timeLimitSeconds = 180;
+
+    vector<ArenaPlayer> players;
+
+    string phase = "LOBBY";
+    string status = "Invite players to JENG Arena.";
+};
+
 vector<Client> clients;
 vector<TicTacToeGame> ticTacToeGames;
 vector<BlackjackGame> blackjackGames;
 vector<ChessGame> chessGames;
 vector<PokerGame> pokerGames;
 vector<RouletteGame> rouletteGames;
+vector<ArenaGame> arenaGames;
 
 static mt19937 rng(random_device{}());
 
@@ -451,13 +475,25 @@ int findPokerGame(Socket socket) {
     return -1;
 }
 
+int findArenaGame(Socket socket) {
+    for (int i = 0; i < (int)arenaGames.size(); i++) {
+        for (const ArenaPlayer& player : arenaGames[i].players) {
+            if (player.socket == socket)
+                return i;
+        }
+    }
+
+    return -1;
+}
+
 bool isPlayerBusy(Socket socket) {
     return
         findTicTacToeGame(socket) != -1 ||
         findBlackjackGame(socket) != -1 ||
         findChessGame(socket) != -1 ||
         findPokerGame(socket) != -1 ||
-        findRouletteGame(socket) != -1;
+        findRouletteGame(socket) != -1 ||
+        findArenaGame(socket) != -1;
 }
 
 
@@ -3351,6 +3387,156 @@ void finishPokerAction(
     sendPokerState(game);
 }
 
+
+// ============================================================
+// JENG ARENA LOBBY HELPERS
+// ============================================================
+
+bool arenaTeamMode(const string& mode) {
+    return mode == "TEAM_2V2" || mode == "TEAM_3V3";
+}
+
+bool validArenaMode(const string& mode) {
+    return
+        mode == "SCORE_FFA" ||
+        mode == "TIME_FFA" ||
+        mode == "DUEL" ||
+        mode == "TEAM_2V2" ||
+        mode == "TEAM_3V3";
+}
+
+int normalizeArenaPlayerCount(const string& mode, int requested) {
+    if (mode == "DUEL")
+        return 2;
+    if (mode == "TEAM_2V2")
+        return 4;
+    if (mode == "TEAM_3V3")
+        return 6;
+
+    return max(2, min(requested, MAX_ARENA_PLAYERS));
+}
+
+int arenaPlayerIndex(const ArenaGame& game, Socket socket) {
+    for (int i = 0; i < (int)game.players.size(); i++) {
+        if (game.players[i].socket == socket)
+            return i;
+    }
+
+    return -1;
+}
+
+bool arenaColorUsed(
+    const ArenaGame& game,
+    int colorIndex,
+    Socket ignoreSocket = INVALID_SOCK
+) {
+    for (const ArenaPlayer& player : game.players) {
+        if (
+            player.socket != ignoreSocket &&
+            player.colorIndex == colorIndex
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int firstAvailableArenaColor(const ArenaGame& game) {
+    for (int color = 0; color < ARENA_COLOR_COUNT; color++) {
+        if (!arenaColorUsed(game, color))
+            return color;
+    }
+
+    return 0;
+}
+
+int chooseArenaTeam(const ArenaGame& game) {
+    int red = 0;
+    int blue = 0;
+
+    for (const ArenaPlayer& player : game.players) {
+        if (player.team == 0)
+            red++;
+        else if (player.team == 1)
+            blue++;
+    }
+
+    return red <= blue ? 0 : 1;
+}
+
+void readyArenaPlayers(ArenaGame& game) {
+    for (const ArenaPlayer& player : game.players)
+        sendReady(player.socket);
+}
+
+void sendArenaPacket(
+    ArenaGame& game,
+    const string& type,
+    const string& data
+) {
+    for (const ArenaPlayer& player : game.players)
+        sendPacket(player.socket, type, data);
+}
+
+void sendArenaError(Socket socket, const string& text) {
+    sendPacket(socket, "ARENA_ERROR", text);
+}
+
+string encodeArenaPlayer(const ArenaPlayer& player) {
+    return
+        getName(player.socket) + "^" +
+        string(player.ready ? "1" : "0") + "^" +
+        to_string(player.colorIndex) + "^" +
+        to_string(player.team);
+}
+
+void sendArenaState(ArenaGame& game) {
+    string payload =
+        game.phase + "|" +
+        game.mode + "|" +
+        to_string(game.maxPlayers) + "|" +
+        to_string(game.scoreLimit) + "|" +
+        to_string(game.timeLimitSeconds) + "|" +
+        getName(game.host) + "|" +
+        game.status + "|" +
+        to_string(game.players.size());
+
+    for (const ArenaPlayer& player : game.players)
+        payload += "|" + encodeArenaPlayer(player);
+
+    sendArenaPacket(game, "ARENA_STATE", payload);
+}
+
+bool allArenaPlayersReady(const ArenaGame& game) {
+    if ((int)game.players.size() != game.maxPlayers)
+        return false;
+
+    for (const ArenaPlayer& player : game.players) {
+        if (!player.ready)
+            return false;
+    }
+
+    return true;
+}
+
+bool parseArenaInt(const string& text, int& value) {
+    try {
+        size_t consumed = 0;
+        int parsed = stoi(text, &consumed);
+
+        if (consumed != text.size())
+            return false;
+
+        value = parsed;
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+
 // ============================================================
 // COMMAND HANDLER
 // ============================================================
@@ -4010,6 +4196,479 @@ void handleCommand(Client& client, const string& line) {
 
         return;
     }
+
+
+    // --------------------------------------------------------
+    // Graphical JENG Arena lobby packets
+    // --------------------------------------------------------
+
+    if (line.rfind("ARENA_CREATE|", 0) == 0) {
+        vector<string> fields;
+        string part;
+        stringstream stream(line.substr(13));
+
+        while (getline(stream, part, '|'))
+            fields.push_back(part);
+
+        if (fields.size() < 5) {
+            sendArenaError(
+                client.socket,
+                "Invalid Arena lobby settings."
+            );
+            return;
+        }
+
+        string mode = fields[0];
+        int requestedPlayers = 0;
+        int scoreLimit = 0;
+        int timeLimit = 0;
+        int colorIndex = 0;
+
+        if (
+            !validArenaMode(mode) ||
+            !parseArenaInt(fields[1], requestedPlayers) ||
+            !parseArenaInt(fields[2], scoreLimit) ||
+            !parseArenaInt(fields[3], timeLimit) ||
+            !parseArenaInt(fields[4], colorIndex)
+        ) {
+            sendArenaError(
+                client.socket,
+                "Invalid Arena lobby settings."
+            );
+            return;
+        }
+
+        if (isPlayerBusy(client.socket)) {
+            sendArenaError(
+                client.socket,
+                "You are already in a game."
+            );
+            return;
+        }
+
+        int maxPlayers =
+            normalizeArenaPlayerCount(
+                mode,
+                requestedPlayers
+            );
+
+        if (scoreLimit < 1 || scoreLimit > 50) {
+            sendArenaError(
+                client.socket,
+                "Arena score limit must be between 1 and 50."
+            );
+            return;
+        }
+
+        if (timeLimit < 60 || timeLimit > 600) {
+            sendArenaError(
+                client.socket,
+                "Arena time limit must be between 60 and 600 seconds."
+            );
+            return;
+        }
+
+        if (
+            !arenaTeamMode(mode) &&
+            (colorIndex < 0 || colorIndex >= ARENA_COLOR_COUNT)
+        ) {
+            sendArenaError(
+                client.socket,
+                "Invalid Arena tank color."
+            );
+            return;
+        }
+
+        ArenaGame game;
+        game.host = client.socket;
+        game.mode = mode;
+        game.maxPlayers = maxPlayers;
+        game.scoreLimit = scoreLimit;
+        game.timeLimitSeconds = timeLimit;
+        game.phase = "LOBBY";
+        game.status = "Arena lobby created. Invite players.";
+
+        ArenaPlayer host;
+        host.socket = client.socket;
+        host.ready = false;
+
+        if (arenaTeamMode(mode)) {
+            host.team = 0;
+            host.colorIndex = -1;
+        }
+        else {
+            host.team = -1;
+            host.colorIndex = colorIndex;
+        }
+
+        game.players.push_back(host);
+        arenaGames.push_back(game);
+
+        sendArenaState(arenaGames.back());
+        readyArenaPlayers(arenaGames.back());
+        return;
+    }
+
+    if (line.rfind("ARENA_INVITE|", 0) == 0) {
+        string targetName = line.substr(13);
+
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendArenaError(
+                client.socket,
+                "Create an Arena lobby first."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (
+            game.host != client.socket ||
+            game.phase != "LOBBY"
+        ) {
+            sendArenaError(
+                client.socket,
+                "Only the Arena host can invite players before the match starts."
+            );
+            return;
+        }
+
+        if ((int)game.players.size() >= game.maxPlayers) {
+            sendArenaError(
+                client.socket,
+                "This Arena lobby is full."
+            );
+            return;
+        }
+
+        Client* target =
+            getClientByName(targetName);
+
+        if (!target) {
+            sendArenaError(
+                client.socket,
+                "User not found."
+            );
+            return;
+        }
+
+        if (target->socket == client.socket) {
+            sendArenaError(
+                client.socket,
+                "You cannot invite yourself."
+            );
+            return;
+        }
+
+        if (isPlayerBusy(target->socket)) {
+            sendArenaError(
+                client.socket,
+                target->name + " is already playing."
+            );
+            return;
+        }
+
+        if (
+            target->pendingChallenge !=
+            INVALID_SOCK
+        ) {
+            sendArenaError(
+                client.socket,
+                target->name +
+                " already has a pending invite."
+            );
+            return;
+        }
+
+        target->pendingChallenge =
+            client.socket;
+
+        target->pendingGame =
+            "arena";
+
+        sendPacket(
+            target->socket,
+            "ARENA_CHALLENGE",
+            client.name + "|" +
+            game.mode + "|" +
+            to_string(game.maxPlayers) + "|" +
+            to_string(game.scoreLimit) + "|" +
+            to_string(game.timeLimitSeconds) + "|" +
+            to_string(game.players.size())
+        );
+
+        game.status =
+            "Invitation sent to " +
+            target->name +
+            ".";
+
+        sendArenaState(game);
+        readyArenaPlayers(game);
+        sendReady(target->socket);
+        return;
+    }
+
+    if (line == "ARENA_READY") {
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendArenaError(
+                client.socket,
+                "You are not in an Arena lobby."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (game.phase != "LOBBY") {
+            sendArenaError(
+                client.socket,
+                "This Arena lobby is already locked."
+            );
+            return;
+        }
+
+        int playerIndex =
+            arenaPlayerIndex(
+                game,
+                client.socket
+            );
+
+        if (playerIndex < 0)
+            return;
+
+        game.players[playerIndex].ready =
+            !game.players[playerIndex].ready;
+
+        game.status =
+            client.name +
+            (
+                game.players[playerIndex].ready
+                ? " is ready."
+                : " is not ready."
+            );
+
+        sendArenaState(game);
+        readyArenaPlayers(game);
+        return;
+    }
+
+    if (line.rfind("ARENA_COLOR|", 0) == 0) {
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendArenaError(
+                client.socket,
+                "You are not in an Arena lobby."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (
+            game.phase != "LOBBY" ||
+            arenaTeamMode(game.mode)
+        ) {
+            sendArenaError(
+                client.socket,
+                "Tank colors cannot be changed for this Arena lobby."
+            );
+            return;
+        }
+
+        int colorIndex = -1;
+
+        if (
+            !parseArenaInt(
+                line.substr(12),
+                colorIndex
+            ) ||
+            colorIndex < 0 ||
+            colorIndex >= ARENA_COLOR_COUNT
+        ) {
+            sendArenaError(
+                client.socket,
+                "Invalid Arena tank color."
+            );
+            return;
+        }
+
+        if (
+            arenaColorUsed(
+                game,
+                colorIndex,
+                client.socket
+            )
+        ) {
+            sendArenaError(
+                client.socket,
+                "That Arena color is already taken."
+            );
+            return;
+        }
+
+        int playerIndex =
+            arenaPlayerIndex(
+                game,
+                client.socket
+            );
+
+        if (playerIndex < 0)
+            return;
+
+        game.players[playerIndex].colorIndex =
+            colorIndex;
+
+        game.players[playerIndex].ready = false;
+
+        game.status =
+            client.name +
+            " changed tank color and must ready again.";
+
+        sendArenaState(game);
+        readyArenaPlayers(game);
+        return;
+    }
+
+    if (line == "ARENA_START") {
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendArenaError(
+                client.socket,
+                "You are not in an Arena lobby."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (game.host != client.socket) {
+            sendArenaError(
+                client.socket,
+                "Only the Arena host can start the match."
+            );
+            return;
+        }
+
+        if (game.phase != "LOBBY") {
+            sendArenaError(
+                client.socket,
+                "This Arena lobby is already locked."
+            );
+            return;
+        }
+
+        if ((int)game.players.size() != game.maxPlayers) {
+            sendArenaError(
+                client.socket,
+                "The Arena lobby must be full before starting."
+            );
+            return;
+        }
+
+        if (!allArenaPlayersReady(game)) {
+            sendArenaError(
+                client.socket,
+                "Every Arena player must be ready before starting."
+            );
+            return;
+        }
+
+        game.phase = "STARTING";
+        game.status =
+            "Lobby locked. Preparing realtime Arena match.";
+
+        sendArenaState(game);
+
+        sendArenaPacket(
+            game,
+            "ARENA_START",
+            game.mode + "|" +
+            to_string(game.scoreLimit) + "|" +
+            to_string(game.timeLimitSeconds)
+        );
+
+        readyArenaPlayers(game);
+        return;
+    }
+
+    if (line == "ARENA_LEAVE") {
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendPacket(
+                client.socket,
+                "ARENA_END",
+                "Left JENG Arena."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (game.host == client.socket) {
+            ArenaGame copy = game;
+
+            for (const ArenaPlayer& player : copy.players) {
+                sendPacket(
+                    player.socket,
+                    "ARENA_END",
+                    "Arena lobby closed because the host left."
+                );
+                sendReady(player.socket);
+            }
+
+            arenaGames.erase(
+                arenaGames.begin() +
+                gameIndex
+            );
+
+            return;
+        }
+
+        int playerIndex =
+            arenaPlayerIndex(
+                game,
+                client.socket
+            );
+
+        if (playerIndex >= 0) {
+            game.players.erase(
+                game.players.begin() +
+                playerIndex
+            );
+        }
+
+        game.status =
+            client.name +
+            " left the Arena lobby.";
+
+        sendPacket(
+            client.socket,
+            "ARENA_END",
+            "Left JENG Arena."
+        );
+
+        sendArenaState(game);
+        readyArenaPlayers(game);
+        return;
+    }
+
 
     // --------------------------------------------------------
     // NORMAL CHAT
@@ -5088,6 +5747,95 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
+
+        // JENG Arena invitations join the host's existing lobby.
+        if (gameType == "arena") {
+            if (isPlayerBusy(accepterSocket)) {
+                clearPendingChallenge(client);
+
+                sendArenaError(
+                    accepterSocket,
+                    "You are already in a game."
+                );
+                return;
+            }
+
+            int arenaIndex =
+                findArenaGame(
+                    challengerSocket
+                );
+
+            if (arenaIndex == -1) {
+                clearPendingChallenge(client);
+
+                sendArenaError(
+                    accepterSocket,
+                    "That Arena lobby no longer exists."
+                );
+                return;
+            }
+
+            ArenaGame& game =
+                arenaGames[arenaIndex];
+
+            if (
+                game.host != challengerSocket ||
+                game.phase != "LOBBY"
+            ) {
+                clearPendingChallenge(client);
+
+                sendArenaError(
+                    accepterSocket,
+                    "That Arena lobby has already started."
+                );
+                return;
+            }
+
+            if (
+                (int)game.players.size() >=
+                game.maxPlayers
+            ) {
+                clearPendingChallenge(client);
+
+                sendArenaError(
+                    accepterSocket,
+                    "That Arena lobby is full."
+                );
+                return;
+            }
+
+            ArenaPlayer player;
+            player.socket = accepterSocket;
+            player.ready = false;
+
+            if (arenaTeamMode(game.mode)) {
+                player.team =
+                    chooseArenaTeam(game);
+                player.colorIndex = -1;
+            }
+            else {
+                player.team = -1;
+                player.colorIndex =
+                    firstAvailableArenaColor(game);
+            }
+
+            game.players.push_back(player);
+
+            clearPendingChallenge(client);
+
+            game.status =
+                client.name +
+                " joined the Arena lobby. " +
+                to_string(game.players.size()) +
+                "/" +
+                to_string(game.maxPlayers) +
+                " players.";
+
+            sendArenaState(game);
+            readyArenaPlayers(game);
+            return;
+        }
+
         if (
             isPlayerBusy(accepterSocket) ||
             isPlayerBusy(challengerSocket)
@@ -5196,6 +5944,8 @@ void handleCommand(Client& client, const string& line) {
             gameName = "Poker";
         else if (client.pendingGame == "roulette")
             gameName = "Roulette";
+        else if (client.pendingGame == "arena")
+            gameName = "JENG Arena";
         else
             gameName = "Tic-Tac-Toe";
 
@@ -5224,6 +5974,14 @@ void handleCommand(Client& client, const string& line) {
                     " declined your Poker invitation."
                 );
             }
+            else if (client.pendingGame == "arena") {
+                sendPacket(
+                    challenger->socket,
+                    "ARENA_NOTICE",
+                    client.name +
+                    " declined your JENG Arena invitation."
+                );
+            }
             else {
                 sendPacket(
                     challenger->socket,
@@ -5241,6 +5999,7 @@ void handleCommand(Client& client, const string& line) {
         bool wasBlackjack = client.pendingGame == "blackjack";
         bool wasRoulette = client.pendingGame == "roulette";
         bool wasPoker = client.pendingGame == "poker";
+        bool wasArena = client.pendingGame == "arena";
         clearPendingChallenge(client);
 
         sendPacket(
@@ -5250,7 +6009,11 @@ void handleCommand(Client& client, const string& line) {
                 : (
                     wasRoulette
                     ? "RLT_NOTICE"
-                    : (wasPoker ? "POKER_NOTICE" : "GAME")
+                    : (
+                        wasPoker
+                        ? "POKER_NOTICE"
+                        : (wasArena ? "ARENA_NOTICE" : "GAME")
+                      )
                   ),
             wasBlackjack
                 ? "Blackjack invitation declined."
@@ -5260,7 +6023,11 @@ void handleCommand(Client& client, const string& line) {
                     : (
                         wasPoker
                         ? "Poker invitation declined."
-                        : "Challenge declined."
+                        : (
+                            wasArena
+                            ? "JENG Arena invitation declined."
+                            : "Challenge declined."
+                          )
                       )
                   )
         );
@@ -6499,10 +7266,34 @@ void disconnectClient(int index) {
         );
 
         if (challenger) {
+            string pendingGame =
+                clients[index].pendingGame;
+
+            string packetType =
+                pendingGame == "blackjack"
+                ? "BJ_NOTICE"
+                : (
+                    pendingGame == "roulette"
+                    ? "RLT_NOTICE"
+                    : (
+                        pendingGame == "poker"
+                        ? "POKER_NOTICE"
+                        : (
+                            pendingGame == "arena"
+                            ? "ARENA_NOTICE"
+                            : "GAME"
+                          )
+                      )
+                  );
+
             sendPacket(
                 challenger->socket,
-                "GAME",
-                "Challenge cancelled because " +
+                packetType,
+                (
+                    pendingGame == "arena"
+                    ? "Arena invitation cancelled because "
+                    : "Challenge cancelled because "
+                ) +
                 name +
                 " disconnected."
             );
@@ -6750,12 +7541,66 @@ void disconnectClient(int index) {
         }
     }
 
+
+    int arenaIndex = findArenaGame(socket);
+
+    if (arenaIndex != -1) {
+        ArenaGame& game =
+            arenaGames[arenaIndex];
+
+        if (game.host == socket) {
+            ArenaGame copy = game;
+
+            for (const ArenaPlayer& player : copy.players) {
+                if (player.socket == socket)
+                    continue;
+
+                sendPacket(
+                    player.socket,
+                    "ARENA_END",
+                    name +
+                    " disconnected. Arena lobby closed."
+                );
+
+                sendReady(player.socket);
+            }
+
+            arenaGames.erase(
+                arenaGames.begin() +
+                arenaIndex
+            );
+        }
+        else {
+            int playerIndex =
+                arenaPlayerIndex(
+                    game,
+                    socket
+                );
+
+            if (playerIndex >= 0) {
+                game.players.erase(
+                    game.players.begin() +
+                    playerIndex
+                );
+            }
+
+            game.status =
+                name +
+                " disconnected from the Arena lobby.";
+
+            sendArenaState(game);
+            readyArenaPlayers(game);
+        }
+    }
+
+
     // Cancel any challenges/invites that this user had sent.
     for (Client& c : clients) {
         if (c.pendingChallenge == socket) {
             bool blackjackInvite = c.pendingGame == "blackjack";
             bool rouletteInvite = c.pendingGame == "roulette";
             bool pokerInvite = c.pendingGame == "poker";
+            bool arenaInvite = c.pendingGame == "arena";
             clearPendingChallenge(c);
 
             sendPacket(
@@ -6765,7 +7610,11 @@ void disconnectClient(int index) {
                     : (
                         rouletteInvite
                         ? "RLT_NOTICE"
-                        : (pokerInvite ? "POKER_NOTICE" : "GAME")
+                        : (
+                            pokerInvite
+                            ? "POKER_NOTICE"
+                            : (arenaInvite ? "ARENA_NOTICE" : "GAME")
+                          )
                       ),
                 blackjackInvite
                     ? "Blackjack invitation cancelled because the host disconnected."
@@ -6775,7 +7624,11 @@ void disconnectClient(int index) {
                         : (
                             pokerInvite
                             ? "Poker invitation cancelled because the host disconnected."
-                            : "Challenge cancelled because the challenger disconnected."
+                            : (
+                                arenaInvite
+                                ? "Arena invitation cancelled because the host disconnected."
+                                : "Challenge cancelled because the challenger disconnected."
+                              )
                           )
                       )
             );
@@ -6860,7 +7713,7 @@ int main() {
     cout << "        JENG CHAT SERVER\n";
     cout << "================================\n";
     cout << "Port: " << PORT << "\n";
-    cout << "Games: Tic-Tac-Toe + Blackjack + Chess\n";
+    cout << "Games: Tic-Tac-Toe + Blackjack + Chess + Poker + Roulette + JENG Arena\n";
     cout << "Waiting for players...\n\n";
 
     while (true) {

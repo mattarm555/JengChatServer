@@ -9,6 +9,7 @@
 #include <random>
 #include <csignal>
 #include <chrono>
+#include <cmath>
 
 #ifdef _WIN32
 
@@ -50,6 +51,20 @@ const int MAX_ROULETTE_ROUNDS = 100;
 const int MAX_ROULETTE_PLAYERS = 6;
 const int MAX_ARENA_PLAYERS = 6;
 const int ARENA_COLOR_COUNT = 16;
+const int ARENA_MAX_HEALTH = 100;
+const int ARENA_SHOT_DAMAGE = 25;
+const float ARENA_HALF = 19.0f;
+const float ARENA_TANK_RADIUS = 0.82f;
+const float ARENA_PLAYER_SPEED = 7.0f;
+const float ARENA_BULLET_SPEED = 36.0f;
+const float ARENA_BULLET_RADIUS = 0.16f;
+const float ARENA_MINE_RADIUS = 0.42f;
+const float ARENA_FIRE_COOLDOWN = 0.16f;
+const float ARENA_MINE_COOLDOWN = 0.50f;
+const float ARENA_RESPAWN_TIME = 2.0f;
+const int ARENA_MINE_DAMAGE = 100;
+const int ARENA_MAX_MINES_PER_PLAYER = 3;
+const float ARENA_PI = 3.14159265358979323846f;
 
 
 bool initializeSocketLibrary() {
@@ -249,11 +264,56 @@ struct PokerGame {
 };
 
 
+struct ArenaProjectile {
+    float x = 0.0f;
+    float y = 1.10f;
+    float z = 0.0f;
+    float vx = 0.0f;
+    float vz = 0.0f;
+    Socket owner = INVALID_SOCK;
+    bool active = true;
+};
+
+struct ArenaMine {
+    float x = 0.0f;
+    float z = 0.0f;
+    Socket owner = INVALID_SOCK;
+    int colorIndex = -1;
+    int team = -1;
+    bool active = true;
+};
+
 struct ArenaPlayer {
     Socket socket = INVALID_SOCK;
     bool ready = false;
     int colorIndex = -1;
     int team = -1; // -1 FFA/duel, 0 red, 1 blue
+
+    // Authoritative realtime movement state.
+    float x = 0.0f;
+    float z = 0.0f;
+    float spawnX = 0.0f;
+    float spawnZ = 0.0f;
+    float bodyYaw = 180.0f;
+    float aimYaw = 180.0f;
+
+    int health = ARENA_MAX_HEALTH;
+    bool alive = true;
+    int kills = 0;
+    int deaths = 0;
+    int damageDealt = 0;
+    int damageTaken = 0;
+    float respawnTimer = 0.0f;
+
+    int lastInputSequence = -1;
+    bool inputClockReady = false;
+    chrono::steady_clock::time_point lastInputAt{};
+
+    bool fireClockReady = false;
+    chrono::steady_clock::time_point lastFireAt{};
+
+    bool mineClockReady = false;
+    chrono::steady_clock::time_point lastMineAt{};
 };
 
 struct ArenaGame {
@@ -264,9 +324,20 @@ struct ArenaGame {
     int timeLimitSeconds = 180;
 
     vector<ArenaPlayer> players;
+    vector<ArenaProjectile> projectiles;
+    vector<ArenaMine> mines;
 
     string phase = "LOBBY";
     string status = "Invite players to JENG Arena.";
+
+    int worldSequence = 0;
+    float timeRemainingSeconds = 180.0f;
+
+    bool broadcastClockReady = false;
+    chrono::steady_clock::time_point lastBroadcastAt{};
+
+    bool simClockReady = false;
+    chrono::steady_clock::time_point lastSimAt{};
 };
 
 vector<Client> clients;
@@ -3536,6 +3607,852 @@ bool parseArenaInt(const string& text, int& value) {
     }
 }
 
+bool parseArenaFloat(const string& text, float& value) {
+    try {
+        size_t consumed = 0;
+        float parsed = stof(text, &consumed);
+
+        if (consumed != text.size() || !isfinite(parsed))
+            return false;
+
+        value = parsed;
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+struct ArenaObstacle2D {
+    float minX;
+    float minZ;
+    float maxX;
+    float maxZ;
+};
+
+bool arenaCircleHitsBox(
+    float x,
+    float z,
+    const ArenaObstacle2D& box
+) {
+    float closestX = max(box.minX, min(x, box.maxX));
+    float closestZ = max(box.minZ, min(z, box.maxZ));
+
+    float dx = x - closestX;
+    float dz = z - closestZ;
+
+    return
+        dx * dx + dz * dz <
+        ARENA_TANK_RADIUS * ARENA_TANK_RADIUS;
+}
+
+bool arenaPositionBlocked(float x, float z) {
+    if (
+        x < -ARENA_HALF + ARENA_TANK_RADIUS ||
+        x >  ARENA_HALF - ARENA_TANK_RADIUS ||
+        z < -ARENA_HALF + ARENA_TANK_RADIUS ||
+        z >  ARENA_HALF - ARENA_TANK_RADIUS
+    ) {
+        return true;
+    }
+
+    static const ArenaObstacle2D obstacles[] = {
+        {-3.0f,  -3.0f,   3.0f,   3.0f},
+        {-14.0f, -2.0f, -10.0f,   2.0f},
+        {10.0f,  -2.0f,  14.0f,   2.0f},
+        {-2.0f, -14.0f,   2.0f, -10.0f},
+        {-2.0f,  10.0f,   2.0f,  14.0f},
+        {-13.0f,-13.0f,  -9.0f,  -9.0f},
+        { 9.0f,   9.0f,  13.0f,  13.0f}
+    };
+
+    for (const ArenaObstacle2D& obstacle : obstacles) {
+        if (arenaCircleHitsBox(x, z, obstacle))
+            return true;
+    }
+
+    return false;
+}
+
+bool arenaPositionBlockedByPlayer(
+    const ArenaGame& game,
+    Socket movingSocket,
+    float x,
+    float z
+) {
+    const float minimumDistance =
+        ARENA_TANK_RADIUS * 2.0f;
+
+    const float minimumDistanceSquared =
+        minimumDistance * minimumDistance;
+
+    for (const ArenaPlayer& other : game.players) {
+        if (
+            other.socket == movingSocket ||
+            !other.alive
+        ) {
+            continue;
+        }
+
+        float dx = x - other.x;
+        float dz = z - other.z;
+
+        if (
+            dx * dx + dz * dz <
+            minimumDistanceSquared
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+float arenaNormalizeYaw(float yaw) {
+    while (yaw > 180.0f)
+        yaw -= 360.0f;
+
+    while (yaw <= -180.0f)
+        yaw += 360.0f;
+
+    return yaw;
+}
+
+float arenaDirectionYaw(float x, float z) {
+    return
+        atan2(x, z) *
+        (180.0f / ARENA_PI);
+}
+
+void respawnArenaPlayer(ArenaPlayer& player) {
+    player.x = player.spawnX;
+    player.z = player.spawnZ;
+    player.health = ARENA_MAX_HEALTH;
+    player.alive = true;
+    player.respawnTimer = 0.0f;
+}
+
+bool arenaPlayersAreEnemies(
+    const ArenaGame& game,
+    const ArenaPlayer& a,
+    const ArenaPlayer& b
+) {
+    if (!arenaTeamMode(game.mode))
+        return a.socket != b.socket;
+
+    return a.team != b.team;
+}
+
+int arenaTeamScore(
+    const ArenaGame& game,
+    int team
+) {
+    int score = 0;
+
+    for (const ArenaPlayer& player : game.players) {
+        if (player.team == team)
+            score += player.kills;
+    }
+
+    return score;
+}
+
+void initializeArenaWorld(ArenaGame& game) {
+    static const float ffaSpawns[6][2] = {
+        {-14.0f,  14.0f},
+        {-14.0f, -14.0f},
+        {  0.0f,  15.0f},
+        { 14.0f, -14.0f},
+        { 14.0f,  14.0f},
+        {  0.0f, -15.0f}
+    };
+
+    static const float redSpawns[3][2] = {
+        {-14.0f,  14.0f},
+        {-14.0f,   0.0f},
+        {-14.0f, -14.0f}
+    };
+
+    static const float blueSpawns[3][2] = {
+        {14.0f, -14.0f},
+        {14.0f,   0.0f},
+        {14.0f,  14.0f}
+    };
+
+    int redIndex = 0;
+    int blueIndex = 0;
+    auto now = chrono::steady_clock::now();
+
+    for (int i = 0; i < (int)game.players.size(); i++) {
+        ArenaPlayer& player = game.players[i];
+
+        if (arenaTeamMode(game.mode)) {
+            if (player.team == 0) {
+                int spawnIndex = min(redIndex, 2);
+                player.spawnX = redSpawns[spawnIndex][0];
+                player.spawnZ = redSpawns[spawnIndex][1];
+                redIndex++;
+                player.bodyYaw = 90.0f;
+                player.aimYaw = 90.0f;
+            }
+            else {
+                int spawnIndex = min(blueIndex, 2);
+                player.spawnX = blueSpawns[spawnIndex][0];
+                player.spawnZ = blueSpawns[spawnIndex][1];
+                blueIndex++;
+                player.bodyYaw = -90.0f;
+                player.aimYaw = -90.0f;
+            }
+        }
+        else {
+            int spawnIndex = min(i, 5);
+            player.spawnX = ffaSpawns[spawnIndex][0];
+            player.spawnZ = ffaSpawns[spawnIndex][1];
+            player.bodyYaw = 180.0f;
+            player.aimYaw = 180.0f;
+        }
+
+        player.lastInputSequence = -1;
+        player.inputClockReady = true;
+        player.lastInputAt = now;
+        player.fireClockReady = false;
+        player.lastFireAt = now;
+        player.mineClockReady = false;
+        player.lastMineAt = now;
+
+        player.kills = 0;
+        player.deaths = 0;
+        player.damageDealt = 0;
+        player.damageTaken = 0;
+        respawnArenaPlayer(player);
+    }
+
+    game.projectiles.clear();
+    game.mines.clear();
+    game.timeRemainingSeconds = (float)game.timeLimitSeconds;
+    game.worldSequence = 0;
+    game.broadcastClockReady = false;
+    game.simClockReady = false;
+}
+
+string encodeArenaWorldPlayer(const ArenaPlayer& player) {
+    return
+        getName(player.socket) + "^" +
+        to_string(player.x) + "^" +
+        to_string(player.z) + "^" +
+        to_string(player.bodyYaw) + "^" +
+        to_string(player.aimYaw) + "^" +
+        to_string(player.colorIndex) + "^" +
+        to_string(player.team) + "^" +
+        to_string(player.health) + "^" +
+        string(player.alive ? "1" : "0") + "^" +
+        to_string(player.kills) + "^" +
+        to_string(player.deaths) + "^" +
+        to_string(player.damageDealt) + "^" +
+        to_string(player.damageTaken) + "^" +
+        to_string(player.respawnTimer);
+}
+
+string encodeArenaProjectile(const ArenaProjectile& projectile) {
+    return
+        to_string(projectile.x) + "^" +
+        to_string(projectile.y) + "^" +
+        to_string(projectile.z);
+}
+
+string encodeArenaMine(const ArenaMine& mine) {
+    return
+        to_string(mine.x) + "^" +
+        to_string(mine.z) + "^" +
+        to_string(mine.colorIndex) + "^" +
+        to_string(mine.team);
+}
+
+void sendArenaWorld(ArenaGame& game) {
+    game.worldSequence++;
+
+    string payload =
+        to_string(game.worldSequence) + "|" +
+        to_string(max(0.0f, game.timeRemainingSeconds)) + "|" +
+        to_string(game.players.size()) + "|" +
+        to_string(game.projectiles.size()) + "|" +
+        to_string(game.mines.size());
+
+    for (const ArenaPlayer& player : game.players)
+        payload += "|" + encodeArenaWorldPlayer(player);
+
+    for (const ArenaProjectile& projectile : game.projectiles)
+        payload += "|" + encodeArenaProjectile(projectile);
+
+    for (const ArenaMine& mine : game.mines)
+        payload += "|" + encodeArenaMine(mine);
+
+    sendArenaPacket(game, "ARENA_WORLD", payload);
+
+    game.lastBroadcastAt = chrono::steady_clock::now();
+    game.broadcastClockReady = true;
+}
+
+void maybeSendArenaWorld(ArenaGame& game) {
+    auto now = chrono::steady_clock::now();
+
+    if (!game.broadcastClockReady) {
+        sendArenaWorld(game);
+        return;
+    }
+
+    float elapsed =
+        chrono::duration<float>(
+            now - game.lastBroadcastAt
+        ).count();
+
+    if (elapsed >= 1.0f / 30.0f)
+        sendArenaWorld(game);
+}
+
+void applyArenaInput(
+    ArenaGame& game,
+    ArenaPlayer& player,
+    int sequence,
+    float moveX,
+    float moveZ,
+    float aimYaw
+) {
+    if (sequence <= player.lastInputSequence)
+        return;
+
+    player.lastInputSequence = sequence;
+
+    auto now = chrono::steady_clock::now();
+    float dt = 1.0f / 30.0f;
+
+    if (player.inputClockReady) {
+        dt = chrono::duration<float>(
+            now - player.lastInputAt
+        ).count();
+    }
+
+    player.lastInputAt = now;
+    player.inputClockReady = true;
+
+    dt = max(0.0f, min(dt, 0.075f));
+
+    player.aimYaw = arenaNormalizeYaw(aimYaw);
+
+    if (!player.alive)
+        return;
+
+    float movementLength =
+        sqrt(moveX * moveX + moveZ * moveZ);
+
+    if (movementLength > 1.0f) {
+        moveX /= movementLength;
+        moveZ /= movementLength;
+        movementLength = 1.0f;
+    }
+
+    if (movementLength > 0.001f) {
+        player.bodyYaw =
+            arenaDirectionYaw(
+                moveX,
+                moveZ
+            );
+
+        float nextX =
+            player.x +
+            moveX * ARENA_PLAYER_SPEED * dt;
+
+        if (
+            !arenaPositionBlocked(nextX, player.z) &&
+            !arenaPositionBlockedByPlayer(
+                game,
+                player.socket,
+                nextX,
+                player.z
+            )
+        ) {
+            player.x = nextX;
+        }
+
+        float nextZ =
+            player.z +
+            moveZ * ARENA_PLAYER_SPEED * dt;
+
+        if (
+            !arenaPositionBlocked(player.x, nextZ) &&
+            !arenaPositionBlockedByPlayer(
+                game,
+                player.socket,
+                player.x,
+                nextZ
+            )
+        ) {
+            player.z = nextZ;
+        }
+    }
+}
+
+void fireArenaProjectile(
+    ArenaGame& game,
+    ArenaPlayer& player
+) {
+    if (!player.alive)
+        return;
+
+    auto now = chrono::steady_clock::now();
+
+    if (player.fireClockReady) {
+        float elapsed = chrono::duration<float>(
+            now - player.lastFireAt
+        ).count();
+
+        if (elapsed < ARENA_FIRE_COOLDOWN)
+            return;
+    }
+
+    player.lastFireAt = now;
+    player.fireClockReady = true;
+
+    float radians = player.aimYaw * (ARENA_PI / 180.0f);
+    float dx = sin(radians);
+    float dz = cos(radians);
+
+    ArenaProjectile projectile;
+    projectile.x = player.x + dx * 1.55f;
+    projectile.y = 1.10f;
+    projectile.z = player.z + dz * 1.55f;
+    projectile.vx = dx * ARENA_BULLET_SPEED;
+    projectile.vz = dz * ARENA_BULLET_SPEED;
+    projectile.owner = player.socket;
+    projectile.active = true;
+
+    game.projectiles.push_back(projectile);
+}
+
+void placeArenaMine(
+    ArenaGame& game,
+    ArenaPlayer& player
+) {
+    if (!player.alive)
+        return;
+
+    auto now = chrono::steady_clock::now();
+
+    if (player.mineClockReady) {
+        float elapsed = chrono::duration<float>(
+            now - player.lastMineAt
+        ).count();
+
+        if (elapsed < ARENA_MINE_COOLDOWN)
+            return;
+    }
+
+    player.lastMineAt = now;
+    player.mineClockReady = true;
+
+    int activeOwned = 0;
+    int oldestOwned = -1;
+
+    for (int i = 0; i < (int)game.mines.size(); i++) {
+        if (
+            game.mines[i].active &&
+            game.mines[i].owner == player.socket
+        ) {
+            activeOwned++;
+
+            if (oldestOwned < 0)
+                oldestOwned = i;
+        }
+    }
+
+    if (
+        activeOwned >= ARENA_MAX_MINES_PER_PLAYER &&
+        oldestOwned >= 0
+    ) {
+        game.mines.erase(
+            game.mines.begin() + oldestOwned
+        );
+    }
+
+    ArenaMine mine;
+    mine.x = player.x;
+    mine.z = player.z;
+    mine.owner = player.socket;
+    mine.colorIndex = player.colorIndex;
+    mine.team = player.team;
+    mine.active = true;
+
+    game.mines.push_back(mine);
+}
+
+bool arenaProjectileHitsObstacle(const ArenaProjectile& projectile) {
+    static const ArenaObstacle2D obstacles[] = {
+        {-3.0f,  -3.0f,   3.0f,   3.0f},
+        {-14.0f, -2.0f, -10.0f,   2.0f},
+        {10.0f,  -2.0f,  14.0f,   2.0f},
+        {-2.0f, -14.0f,   2.0f, -10.0f},
+        {-2.0f,  10.0f,   2.0f,  14.0f},
+        {-13.0f,-13.0f,  -9.0f,  -9.0f},
+        { 9.0f,   9.0f,  13.0f,  13.0f}
+    };
+
+    for (const ArenaObstacle2D& obstacle : obstacles) {
+        if (
+            projectile.x + ARENA_BULLET_RADIUS > obstacle.minX &&
+            projectile.x - ARENA_BULLET_RADIUS < obstacle.maxX &&
+            projectile.z + ARENA_BULLET_RADIUS > obstacle.minZ &&
+            projectile.z - ARENA_BULLET_RADIUS < obstacle.maxZ
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void damageArenaPlayer(
+    ArenaGame& game,
+    int attackerIndex,
+    int victimIndex,
+    int damage = ARENA_SHOT_DAMAGE
+) {
+    if (
+        victimIndex < 0 ||
+        victimIndex >= (int)game.players.size()
+    ) {
+        return;
+    }
+
+    ArenaPlayer& target = game.players[victimIndex];
+
+    if (!target.alive)
+        return;
+
+    int appliedDamage = min(damage, target.health);
+    target.health -= appliedDamage;
+    target.damageTaken += appliedDamage;
+
+    if (
+        attackerIndex >= 0 &&
+        attackerIndex < (int)game.players.size()
+    ) {
+        game.players[attackerIndex].damageDealt += appliedDamage;
+    }
+
+    if (target.health > 0)
+        return;
+
+    target.health = 0;
+    target.alive = false;
+    target.respawnTimer = ARENA_RESPAWN_TIME;
+    target.deaths++;
+
+    if (
+        attackerIndex >= 0 &&
+        attackerIndex < (int)game.players.size() &&
+        attackerIndex != victimIndex
+    ) {
+        game.players[attackerIndex].kills++;
+    }
+}
+
+void updateArenaProjectiles(
+    ArenaGame& game,
+    float dt
+) {
+    for (ArenaProjectile& projectile : game.projectiles) {
+        if (!projectile.active)
+            continue;
+
+        projectile.x += projectile.vx * dt;
+        projectile.z += projectile.vz * dt;
+
+        if (
+            fabs(projectile.x) > 22.0f ||
+            fabs(projectile.z) > 22.0f
+        ) {
+            projectile.active = false;
+            continue;
+        }
+
+        if (arenaProjectileHitsObstacle(projectile)) {
+            projectile.active = false;
+            continue;
+        }
+
+        int attackerIndex = -1;
+
+        for (int i = 0; i < (int)game.players.size(); i++) {
+            if (game.players[i].socket == projectile.owner) {
+                attackerIndex = i;
+                break;
+            }
+        }
+
+        for (int i = 0; i < (int)game.players.size(); i++) {
+            ArenaPlayer& target = game.players[i];
+
+            if (!target.alive || target.socket == projectile.owner)
+                continue;
+
+            if (
+                attackerIndex >= 0 &&
+                !arenaPlayersAreEnemies(
+                    game,
+                    game.players[attackerIndex],
+                    target
+                )
+            ) {
+                continue;
+            }
+
+            float dx = projectile.x - target.x;
+            float dz = projectile.z - target.z;
+            float radius = ARENA_TANK_RADIUS + ARENA_BULLET_RADIUS;
+
+            if (dx * dx + dz * dz <= radius * radius) {
+                damageArenaPlayer(
+                    game,
+                    attackerIndex,
+                    i
+                );
+
+                projectile.active = false;
+                break;
+            }
+        }
+    }
+
+    game.projectiles.erase(
+        remove_if(
+            game.projectiles.begin(),
+            game.projectiles.end(),
+            [](const ArenaProjectile& projectile) {
+                return !projectile.active;
+            }
+        ),
+        game.projectiles.end()
+    );
+}
+
+void updateArenaMines(ArenaGame& game) {
+    for (ArenaMine& mine : game.mines) {
+        if (!mine.active)
+            continue;
+
+        int ownerIndex = -1;
+
+        for (int i = 0; i < (int)game.players.size(); i++) {
+            if (game.players[i].socket == mine.owner) {
+                ownerIndex = i;
+                break;
+            }
+        }
+
+        if (ownerIndex < 0) {
+            mine.active = false;
+            continue;
+        }
+
+        for (int i = 0; i < (int)game.players.size(); i++) {
+            ArenaPlayer& target = game.players[i];
+
+            if (!target.alive || target.socket == mine.owner)
+                continue;
+
+            if (
+                !arenaPlayersAreEnemies(
+                    game,
+                    game.players[ownerIndex],
+                    target
+                )
+            ) {
+                continue;
+            }
+
+            float dx = mine.x - target.x;
+            float dz = mine.z - target.z;
+            float radius =
+                ARENA_TANK_RADIUS +
+                ARENA_MINE_RADIUS;
+
+            if (dx * dx + dz * dz <= radius * radius) {
+                damageArenaPlayer(
+                    game,
+                    ownerIndex,
+                    i,
+                    ARENA_MINE_DAMAGE
+                );
+
+                mine.active = false;
+                break;
+            }
+        }
+    }
+
+    game.mines.erase(
+        remove_if(
+            game.mines.begin(),
+            game.mines.end(),
+            [](const ArenaMine& mine) {
+                return !mine.active;
+            }
+        ),
+        game.mines.end()
+    );
+}
+
+void updateArenaRespawns(
+    ArenaGame& game,
+    float dt
+) {
+    for (ArenaPlayer& player : game.players) {
+        if (player.alive)
+            continue;
+
+        player.respawnTimer -= dt;
+
+        if (player.respawnTimer <= 0.0f)
+            respawnArenaPlayer(player);
+    }
+}
+
+bool evaluateArenaMatchEnd(
+    const ArenaGame& game,
+    string& endText
+) {
+    if (game.mode == "TIME_FFA") {
+        if (game.timeRemainingSeconds > 0.0f)
+            return false;
+
+        int bestKills = -1;
+        int bestPlayer = -1;
+        bool tie = false;
+
+        for (int i = 0; i < (int)game.players.size(); i++) {
+            const ArenaPlayer& player = game.players[i];
+
+            if (player.kills > bestKills) {
+                bestKills = player.kills;
+                bestPlayer = i;
+                tie = false;
+            }
+            else if (player.kills == bestKills) {
+                tie = true;
+            }
+        }
+
+        if (tie || bestPlayer < 0) {
+            endText = "MATCH OVER - DRAW";
+        }
+        else {
+            endText =
+                "MATCH OVER - " +
+                getName(game.players[bestPlayer].socket) +
+                " wins the timed FFA.";
+        }
+
+        return true;
+    }
+
+    if (arenaTeamMode(game.mode)) {
+        int redScore = arenaTeamScore(game, 0);
+        int blueScore = arenaTeamScore(game, 1);
+
+        if (redScore >= game.scoreLimit) {
+            endText =
+                "MATCH OVER - RED TEAM WINS " +
+                to_string(redScore) +
+                "-" +
+                to_string(blueScore);
+            return true;
+        }
+
+        if (blueScore >= game.scoreLimit) {
+            endText =
+                "MATCH OVER - BLUE TEAM WINS " +
+                to_string(blueScore) +
+                "-" +
+                to_string(redScore);
+            return true;
+        }
+
+        return false;
+    }
+
+    for (const ArenaPlayer& player : game.players) {
+        if (player.kills >= game.scoreLimit) {
+            endText =
+                "MATCH OVER - " +
+                getName(player.socket) +
+                " wins.";
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void processArenaRealtimeTick() {
+    auto now = chrono::steady_clock::now();
+
+    for (int i = 0; i < (int)arenaGames.size();) {
+        ArenaGame& game = arenaGames[i];
+
+        if (game.phase != "PLAYING") {
+            i++;
+            continue;
+        }
+
+        float dt = 1.0f / 60.0f;
+
+        if (game.simClockReady) {
+            dt = chrono::duration<float>(
+                now - game.lastSimAt
+            ).count();
+        }
+
+        game.lastSimAt = now;
+        game.simClockReady = true;
+
+        dt = max(0.0f, min(dt, 0.05f));
+
+        if (game.mode == "TIME_FFA") {
+            game.timeRemainingSeconds = max(
+                0.0f,
+                game.timeRemainingSeconds - dt
+            );
+        }
+
+        updateArenaProjectiles(game, dt);
+        updateArenaMines(game);
+        updateArenaRespawns(game, dt);
+
+        string endText;
+        if (evaluateArenaMatchEnd(game, endText)) {
+            // Preserve the Arena party after a normal match ends. Publish one
+            // final authoritative snapshot so every client has the exact
+            // scoreboard, then move the same game object into POSTGAME.
+            game.projectiles.clear();
+            sendArenaWorld(game);
+
+            game.phase = "POSTGAME";
+            game.status = endText;
+
+            for (ArenaPlayer& player : game.players)
+                player.ready = false;
+
+            sendArenaState(game);
+            readyArenaPlayers(game);
+            i++;
+            continue;
+        }
+
+        maybeSendArenaWorld(game);
+        i++;
+    }
+}
+
 
 // ============================================================
 // COMMAND HANDLER
@@ -4587,11 +5504,11 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        game.phase = "STARTING";
+        game.phase = "PLAYING";
         game.status =
-            "Lobby locked. Preparing realtime Arena match.";
+            "Online combat active.";
 
-        sendArenaState(game);
+        initializeArenaWorld(game);
 
         sendArenaPacket(
             game,
@@ -4601,6 +5518,183 @@ void handleCommand(Client& client, const string& line) {
             to_string(game.timeLimitSeconds)
         );
 
+        sendArenaState(game);
+        sendArenaWorld(game);
+        readyArenaPlayers(game);
+        return;
+    }
+
+    if (line.rfind("ARENA_INPUT|", 0) == 0) {
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendArenaError(
+                client.socket,
+                "You are not in an Arena match."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (game.phase != "PLAYING") {
+            sendArenaError(
+                client.socket,
+                "Arena movement is only available during an active match."
+            );
+            return;
+        }
+
+        vector<string> fields;
+        string part;
+        stringstream stream(
+            line.substr(12)
+        );
+
+        while (getline(stream, part, '|'))
+            fields.push_back(part);
+
+        if (fields.size() < 4)
+            return;
+
+        int sequence = -1;
+        float moveX = 0.0f;
+        float moveZ = 0.0f;
+        float aimYaw = 180.0f;
+        int fireRequested = 0;
+
+        if (
+            !parseArenaInt(fields[0], sequence) ||
+            !parseArenaFloat(fields[1], moveX) ||
+            !parseArenaFloat(fields[2], moveZ) ||
+            !parseArenaFloat(fields[3], aimYaw)
+        ) {
+            return;
+        }
+
+        if (fields.size() >= 5)
+            parseArenaInt(fields[4], fireRequested);
+
+        // Reject obviously malformed movement vectors instead of trusting
+        // arbitrary client-provided values. Normal vectors are normalized
+        // again inside applyArenaInput().
+        if (
+            fabs(moveX) > 2.0f ||
+            fabs(moveZ) > 2.0f ||
+            fabs(aimYaw) > 100000.0f
+        ) {
+            return;
+        }
+
+        int playerIndex =
+            arenaPlayerIndex(
+                game,
+                client.socket
+            );
+
+        if (playerIndex < 0)
+            return;
+
+        applyArenaInput(
+            game,
+            game.players[playerIndex],
+            sequence,
+            moveX,
+            moveZ,
+            aimYaw
+        );
+
+        if (fireRequested != 0) {
+            fireArenaProjectile(
+                game,
+                game.players[playerIndex]
+            );
+        }
+
+        maybeSendArenaWorld(game);
+        return;
+    }
+
+    if (line == "ARENA_MINE") {
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendArenaError(
+                client.socket,
+                "You are not in an Arena match."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (game.phase != "PLAYING") {
+            sendArenaError(
+                client.socket,
+                "Mines are only available during an active Arena match."
+            );
+            return;
+        }
+
+        int playerIndex =
+            arenaPlayerIndex(
+                game,
+                client.socket
+            );
+
+        if (playerIndex < 0)
+            return;
+
+        placeArenaMine(
+            game,
+            game.players[playerIndex]
+        );
+
+        maybeSendArenaWorld(game);
+        return;
+    }
+
+    if (line == "ARENA_PLAY_AGAIN") {
+        int gameIndex =
+            findArenaGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendArenaError(
+                client.socket,
+                "You are not in an Arena post-game party."
+            );
+            return;
+        }
+
+        ArenaGame& game =
+            arenaGames[gameIndex];
+
+        if (game.phase != "POSTGAME") {
+            sendArenaError(
+                client.socket,
+                "Play Again is only available after the Arena match ends."
+            );
+            return;
+        }
+
+        // Returning to the lobby is a party-wide action. Nobody is auto-ready;
+        // the same players stay together and can change color / ready up again.
+        game.phase = "LOBBY";
+        game.status =
+            "Party returned to the Arena lobby. Ready up for the next match.";
+        game.projectiles.clear();
+        game.mines.clear();
+        game.broadcastClockReady = false;
+        game.simClockReady = false;
+
+        for (ArenaPlayer& player : game.players)
+            player.ready = false;
+
+        sendArenaState(game);
         readyArenaPlayers(game);
         return;
     }
@@ -4620,6 +5714,78 @@ void handleCommand(Client& client, const string& line) {
 
         ArenaGame& game =
             arenaGames[gameIndex];
+
+        if (game.phase == "POSTGAME") {
+            int playerIndex =
+                arenaPlayerIndex(
+                    game,
+                    client.socket
+                );
+
+            bool hostLeft =
+                game.host == client.socket;
+
+            if (playerIndex >= 0) {
+                game.players.erase(
+                    game.players.begin() +
+                    playerIndex
+                );
+            }
+
+            sendPacket(
+                client.socket,
+                "ARENA_END",
+                "Left the Arena party."
+            );
+            sendReady(client.socket);
+
+            if (game.players.empty()) {
+                arenaGames.erase(
+                    arenaGames.begin() +
+                    gameIndex
+                );
+                return;
+            }
+
+            if (hostLeft)
+                game.host = game.players.front().socket;
+
+            game.status =
+                client.name +
+                " left the Arena party.";
+
+            if (hostLeft) {
+                game.status +=
+                    " " +
+                    getName(game.host) +
+                    " is now host.";
+            }
+
+            sendArenaState(game);
+            readyArenaPlayers(game);
+            return;
+        }
+
+        if (game.phase == "PLAYING") {
+            ArenaGame copy = game;
+
+            for (const ArenaPlayer& player : copy.players) {
+                sendPacket(
+                    player.socket,
+                    "ARENA_END",
+                    client.name +
+                    " left the online Arena match."
+                );
+                sendReady(player.socket);
+            }
+
+            arenaGames.erase(
+                arenaGames.begin() +
+                gameIndex
+            );
+
+            return;
+        }
 
         if (game.host == client.socket) {
             ArenaGame copy = game;
@@ -5517,9 +6683,6 @@ void handleCommand(Client& client, const string& line) {
         }
 
         string gameType = client.pendingGame;
-        int startingChips = client.pendingChips;
-        int hands = client.pendingHands;
-        int pokerSmallBlind = client.pendingHands;
 
         Socket challengerSocket = challenger->socket;
         Socket accepterSocket = client.socket;
@@ -7548,7 +8711,28 @@ void disconnectClient(int index) {
         ArenaGame& game =
             arenaGames[arenaIndex];
 
-        if (game.host == socket) {
+        if (game.phase == "PLAYING") {
+            ArenaGame copy = game;
+
+            for (const ArenaPlayer& player : copy.players) {
+                if (player.socket == socket)
+                    continue;
+
+                sendPacket(
+                    player.socket,
+                    "ARENA_END",
+                    name +
+                    " disconnected. Online Arena match ended."
+                );
+                sendReady(player.socket);
+            }
+
+            arenaGames.erase(
+                arenaGames.begin() +
+                arenaIndex
+            );
+        }
+        else if (game.host == socket) {
             ArenaGame copy = game;
 
             for (const ArenaPlayer& player : copy.players) {
@@ -7741,7 +8925,7 @@ int main() {
 
         timeval timeout{};
         timeout.tv_sec = 0;
-        timeout.tv_usec = 100000; // 100 ms timer tick
+        timeout.tv_usec = 16000; // ~16 ms timer tick for realtime Arena sync
 
         if (
             select(
@@ -7758,6 +8942,7 @@ int main() {
         // Handle delayed Blackjack deals even when no socket traffic
         // arrives during this loop iteration.
         processBlackjackDealTimers();
+        processArenaRealtimeTick();
 
         // New connection.
         if (FD_ISSET(serverSocket, &readSet)) {

@@ -53,7 +53,7 @@ const int MAX_ARENA_PLAYERS = 6;
 const int ARENA_COLOR_COUNT = 16;
 const int ARENA_MAX_HEALTH = 100;
 const int ARENA_SHOT_DAMAGE = 25;
-const float ARENA_HALF = 19.0f;
+const float ARENA_HALF = 25.0f;
 const float ARENA_TANK_RADIUS = 0.82f;
 const float ARENA_PLAYER_SPEED = 7.0f;
 const float ARENA_BULLET_SPEED = 36.0f;
@@ -3657,13 +3657,15 @@ bool arenaPositionBlocked(float x, float z) {
     }
 
     static const ArenaObstacle2D obstacles[] = {
-        {-3.0f,  -3.0f,   3.0f,   3.0f},
-        {-14.0f, -2.0f, -10.0f,   2.0f},
-        {10.0f,  -2.0f,  14.0f,   2.0f},
-        {-2.0f, -14.0f,   2.0f, -10.0f},
-        {-2.0f,  10.0f,   2.0f,  14.0f},
-        {-13.0f,-13.0f,  -9.0f,  -9.0f},
-        { 9.0f,   9.0f,  13.0f,  13.0f}
+        {-4.5f,  -4.5f,   4.5f,   4.5f},
+        {-20.0f, -2.2f, -15.0f,   2.2f},
+        { 15.0f, -2.2f,  20.0f,   2.2f},
+        {-2.2f, -20.0f,   2.2f, -15.0f},
+        {-2.2f,  15.0f,   2.2f,  20.0f},
+        {-17.0f,-17.0f, -12.0f, -12.0f},
+        { 12.0f,-17.0f,  17.0f, -12.0f},
+        {-17.0f, 12.0f, -12.0f,  17.0f},
+        { 12.0f, 12.0f,  17.0f,  17.0f}
     };
 
     for (const ArenaObstacle2D& obstacle : obstacles) {
@@ -3725,20 +3727,20 @@ float arenaDirectionYaw(float x, float z) {
 }
 
 static const float ARENA_FFA_SPAWNS[8][2] = {
-    {-15.0f,  15.0f}, { 0.0f,  16.0f},
-    { 15.0f,  15.0f}, {16.0f,   0.0f},
-    { 15.0f, -15.0f}, { 0.0f, -16.0f},
-    {-15.0f, -15.0f}, {-16.0f,  0.0f}
+    {-21.0f,  21.0f}, { 0.0f,  22.0f},
+    { 21.0f,  21.0f}, {22.0f,   0.0f},
+    { 21.0f, -21.0f}, { 0.0f, -22.0f},
+    {-21.0f, -21.0f}, {-22.0f,  0.0f}
 };
 
 static const float ARENA_RED_SPAWNS[4][2] = {
-    {-15.0f, 15.0f}, {-16.0f, 5.0f},
-    {-16.0f, -5.0f}, {-15.0f, -15.0f}
+    {-21.0f, 16.0f}, {-22.0f, 5.0f},
+    {-22.0f, -5.0f}, {-21.0f, -16.0f}
 };
 
 static const float ARENA_BLUE_SPAWNS[4][2] = {
-    {15.0f, -15.0f}, {16.0f, -5.0f},
-    {16.0f, 5.0f}, {15.0f, 15.0f}
+    {21.0f, -16.0f}, {22.0f, -5.0f},
+    {22.0f, 5.0f}, {21.0f, 16.0f}
 };
 
 bool arenaSpawnIsClear(
@@ -3816,7 +3818,7 @@ void chooseArenaSpawn(
 
     shuffle(candidates.begin(), candidates.end(), rng);
 
-    constexpr float SAFE_SPAWN_DISTANCE = 5.0f;
+    constexpr float SAFE_SPAWN_DISTANCE = 7.0f;
 
     for (const auto& spawn : candidates) {
         if (
@@ -4186,13 +4188,15 @@ void placeArenaMine(
 
 bool arenaProjectileHitsObstacle(const ArenaProjectile& projectile) {
     static const ArenaObstacle2D obstacles[] = {
-        {-3.0f,  -3.0f,   3.0f,   3.0f},
-        {-14.0f, -2.0f, -10.0f,   2.0f},
-        {10.0f,  -2.0f,  14.0f,   2.0f},
-        {-2.0f, -14.0f,   2.0f, -10.0f},
-        {-2.0f,  10.0f,   2.0f,  14.0f},
-        {-13.0f,-13.0f,  -9.0f,  -9.0f},
-        { 9.0f,   9.0f,  13.0f,  13.0f}
+        {-4.5f,  -4.5f,   4.5f,   4.5f},
+        {-20.0f, -2.2f, -15.0f,   2.2f},
+        { 15.0f, -2.2f,  20.0f,   2.2f},
+        {-2.2f, -20.0f,   2.2f, -15.0f},
+        {-2.2f,  15.0f,   2.2f,  20.0f},
+        {-17.0f,-17.0f, -12.0f, -12.0f},
+        { 12.0f,-17.0f,  17.0f, -12.0f},
+        {-17.0f, 12.0f, -12.0f,  17.0f},
+        { 12.0f, 12.0f,  17.0f,  17.0f}
     };
 
     for (const ArenaObstacle2D& obstacle : obstacles) {

@@ -3724,9 +3724,154 @@ float arenaDirectionYaw(float x, float z) {
         (180.0f / ARENA_PI);
 }
 
-void respawnArenaPlayer(ArenaPlayer& player) {
+static const float ARENA_FFA_SPAWNS[8][2] = {
+    {-15.0f,  15.0f}, { 0.0f,  16.0f},
+    { 15.0f,  15.0f}, {16.0f,   0.0f},
+    { 15.0f, -15.0f}, { 0.0f, -16.0f},
+    {-15.0f, -15.0f}, {-16.0f,  0.0f}
+};
+
+static const float ARENA_RED_SPAWNS[4][2] = {
+    {-15.0f, 15.0f}, {-16.0f, 5.0f},
+    {-16.0f, -5.0f}, {-15.0f, -15.0f}
+};
+
+static const float ARENA_BLUE_SPAWNS[4][2] = {
+    {15.0f, -15.0f}, {16.0f, -5.0f},
+    {16.0f, 5.0f}, {15.0f, 15.0f}
+};
+
+bool arenaSpawnIsClear(
+    const ArenaGame& game,
+    Socket respawningSocket,
+    float x,
+    float z,
+    float minimumDistance
+) {
+    float minimumDistanceSquared =
+        minimumDistance * minimumDistance;
+
+    for (const ArenaPlayer& other : game.players) {
+        if (other.socket == respawningSocket || !other.alive)
+            continue;
+
+        float dx = x - other.x;
+        float dz = z - other.z;
+
+        if (dx * dx + dz * dz < minimumDistanceSquared)
+            return false;
+    }
+
+    return true;
+}
+
+float arenaNearestLivingPlayerDistanceSquared(
+    const ArenaGame& game,
+    Socket respawningSocket,
+    float x,
+    float z
+) {
+    float best = 1000000.0f;
+    bool found = false;
+
+    for (const ArenaPlayer& other : game.players) {
+        if (other.socket == respawningSocket || !other.alive)
+            continue;
+
+        float dx = x - other.x;
+        float dz = z - other.z;
+        float distanceSquared = dx * dx + dz * dz;
+
+        if (distanceSquared < best)
+            best = distanceSquared;
+
+        found = true;
+    }
+
+    return found ? best : 1000000.0f;
+}
+
+void chooseArenaSpawn(
+    ArenaGame& game,
+    ArenaPlayer& player
+) {
+    vector<array<float, 2>> candidates;
+
+    if (arenaTeamMode(game.mode)) {
+        const float (*spawns)[2] =
+            player.team == 0
+            ? ARENA_RED_SPAWNS
+            : ARENA_BLUE_SPAWNS;
+
+        for (int i = 0; i < 4; i++)
+            candidates.push_back({spawns[i][0], spawns[i][1]});
+    }
+    else {
+        for (int i = 0; i < 8; i++)
+            candidates.push_back({
+                ARENA_FFA_SPAWNS[i][0],
+                ARENA_FFA_SPAWNS[i][1]
+            });
+    }
+
+    shuffle(candidates.begin(), candidates.end(), rng);
+
+    constexpr float SAFE_SPAWN_DISTANCE = 5.0f;
+
+    for (const auto& spawn : candidates) {
+        if (
+            arenaSpawnIsClear(
+                game,
+                player.socket,
+                spawn[0],
+                spawn[1],
+                SAFE_SPAWN_DISTANCE
+            )
+        ) {
+            player.spawnX = spawn[0];
+            player.spawnZ = spawn[1];
+            return;
+        }
+    }
+
+    float bestDistanceSquared = -1.0f;
+
+    for (const auto& spawn : candidates) {
+        float distanceSquared =
+            arenaNearestLivingPlayerDistanceSquared(
+                game,
+                player.socket,
+                spawn[0],
+                spawn[1]
+            );
+
+        if (distanceSquared > bestDistanceSquared) {
+            bestDistanceSquared = distanceSquared;
+            player.spawnX = spawn[0];
+            player.spawnZ = spawn[1];
+        }
+    }
+}
+
+void respawnArenaPlayer(
+    ArenaGame& game,
+    ArenaPlayer& player
+) {
+    chooseArenaSpawn(game, player);
+
     player.x = player.spawnX;
     player.z = player.spawnZ;
+
+    if (arenaTeamMode(game.mode)) {
+        player.bodyYaw =
+            player.team == 0 ? 90.0f : -90.0f;
+    }
+    else {
+        player.bodyYaw =
+            arenaDirectionYaw(-player.x, -player.z);
+    }
+
+    player.aimYaw = player.bodyYaw;
     player.health = ARENA_MAX_HEALTH;
     player.alive = true;
     player.respawnTimer = 0.0f;
@@ -3758,59 +3903,13 @@ int arenaTeamScore(
 }
 
 void initializeArenaWorld(ArenaGame& game) {
-    static const float ffaSpawns[6][2] = {
-        {-14.0f,  14.0f},
-        {-14.0f, -14.0f},
-        {  0.0f,  15.0f},
-        { 14.0f, -14.0f},
-        { 14.0f,  14.0f},
-        {  0.0f, -15.0f}
-    };
-
-    static const float redSpawns[3][2] = {
-        {-14.0f,  14.0f},
-        {-14.0f,   0.0f},
-        {-14.0f, -14.0f}
-    };
-
-    static const float blueSpawns[3][2] = {
-        {14.0f, -14.0f},
-        {14.0f,   0.0f},
-        {14.0f,  14.0f}
-    };
-
-    int redIndex = 0;
-    int blueIndex = 0;
     auto now = chrono::steady_clock::now();
+
+    for (ArenaPlayer& player : game.players)
+        player.alive = false;
 
     for (int i = 0; i < (int)game.players.size(); i++) {
         ArenaPlayer& player = game.players[i];
-
-        if (arenaTeamMode(game.mode)) {
-            if (player.team == 0) {
-                int spawnIndex = min(redIndex, 2);
-                player.spawnX = redSpawns[spawnIndex][0];
-                player.spawnZ = redSpawns[spawnIndex][1];
-                redIndex++;
-                player.bodyYaw = 90.0f;
-                player.aimYaw = 90.0f;
-            }
-            else {
-                int spawnIndex = min(blueIndex, 2);
-                player.spawnX = blueSpawns[spawnIndex][0];
-                player.spawnZ = blueSpawns[spawnIndex][1];
-                blueIndex++;
-                player.bodyYaw = -90.0f;
-                player.aimYaw = -90.0f;
-            }
-        }
-        else {
-            int spawnIndex = min(i, 5);
-            player.spawnX = ffaSpawns[spawnIndex][0];
-            player.spawnZ = ffaSpawns[spawnIndex][1];
-            player.bodyYaw = 180.0f;
-            player.aimYaw = 180.0f;
-        }
 
         player.lastInputSequence = -1;
         player.inputClockReady = true;
@@ -3824,7 +3923,7 @@ void initializeArenaWorld(ArenaGame& game) {
         player.deaths = 0;
         player.damageDealt = 0;
         player.damageTaken = 0;
-        respawnArenaPlayer(player);
+        respawnArenaPlayer(game, player);
     }
 
     game.projectiles.clear();
@@ -4313,7 +4412,7 @@ void updateArenaRespawns(
         player.respawnTimer -= dt;
 
         if (player.respawnTimer <= 0.0f)
-            respawnArenaPlayer(player);
+            respawnArenaPlayer(game, player);
     }
 }
 

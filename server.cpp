@@ -105,19 +105,6 @@ struct Client {
     int pendingHands = 0;
 };
 
-struct TicTacToeGame {
-    Socket playerX;
-    Socket playerO;
-
-    char board[9] = {
-        ' ', ' ', ' ',
-        ' ', ' ', ' ',
-        ' ', ' ', ' '
-    };
-
-    Socket turn;
-};
-
 struct Card {
     string rank;
     char suit;
@@ -342,7 +329,6 @@ struct ArenaGame {
 };
 
 vector<Client> clients;
-vector<TicTacToeGame> ticTacToeGames;
 vector<BlackjackGame> blackjackGames;
 vector<ChessGame> chessGames;
 vector<PokerGame> pokerGames;
@@ -486,19 +472,6 @@ void broadcastChat(
 // GAME LOOKUPS
 // ============================================================
 
-int findTicTacToeGame(Socket socket) {
-    for (int i = 0; i < (int)ticTacToeGames.size(); i++) {
-        if (
-            ticTacToeGames[i].playerX == socket ||
-            ticTacToeGames[i].playerO == socket
-        ) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
 int findBlackjackGame(Socket socket) {
     for (int i = 0; i < (int)blackjackGames.size(); i++) {
         for (const BlackjackPlayer& player : blackjackGames[i].players) {
@@ -560,146 +533,11 @@ int findArenaGame(Socket socket) {
 
 bool isPlayerBusy(Socket socket) {
     return
-        findTicTacToeGame(socket) != -1 ||
         findBlackjackGame(socket) != -1 ||
         findChessGame(socket) != -1 ||
         findPokerGame(socket) != -1 ||
         findRouletteGame(socket) != -1 ||
         findArenaGame(socket) != -1;
-}
-
-
-// ============================================================
-// TIC-TAC-TOE
-// ============================================================
-
-void sendTicTacToeLine(
-    TicTacToeGame& game,
-    const string& text
-) {
-    sendPacket(
-        game.playerX,
-        "GAME",
-        text
-    );
-
-    sendPacket(
-        game.playerO,
-        "GAME",
-        text
-    );
-}
-
-char displayCell(TicTacToeGame& game, int index) {
-    if (game.board[index] != ' ')
-        return game.board[index];
-
-    return '1' + index;
-}
-
-void showTicTacToeBoard(
-    TicTacToeGame& game,
-    bool showTurn = true
-) {
-    sendTicTacToeLine(game, "");
-    sendTicTacToeLine(game, "========== TIC-TAC-TOE ==========");
-
-    sendTicTacToeLine(
-        game,
-        getName(game.playerX) +
-        " (X) vs " +
-        getName(game.playerO) +
-        " (O)"
-    );
-
-    sendTicTacToeLine(game, "");
-
-    string row1;
-    row1 += " ";
-    row1 += displayCell(game, 0);
-    row1 += " | ";
-    row1 += displayCell(game, 1);
-    row1 += " | ";
-    row1 += displayCell(game, 2);
-
-    string row2;
-    row2 += " ";
-    row2 += displayCell(game, 3);
-    row2 += " | ";
-    row2 += displayCell(game, 4);
-    row2 += " | ";
-    row2 += displayCell(game, 5);
-
-    string row3;
-    row3 += " ";
-    row3 += displayCell(game, 6);
-    row3 += " | ";
-    row3 += displayCell(game, 7);
-    row3 += " | ";
-    row3 += displayCell(game, 8);
-
-    sendTicTacToeLine(game, row1);
-    sendTicTacToeLine(game, "---+---+---");
-    sendTicTacToeLine(game, row2);
-    sendTicTacToeLine(game, "---+---+---");
-    sendTicTacToeLine(game, row3);
-    sendTicTacToeLine(game, "");
-
-    if (showTurn) {
-        string symbol =
-            game.turn == game.playerX
-            ? "X"
-            : "O";
-
-        sendTicTacToeLine(
-            game,
-            "Turn: " +
-            getName(game.turn) +
-            " (" +
-            symbol +
-            ")"
-        );
-    }
-
-    sendTicTacToeLine(game, "================================");
-    sendTicTacToeLine(game, "");
-}
-
-bool ticTacToeWinner(
-    TicTacToeGame& game,
-    char symbol
-) {
-    int combinations[8][3] = {
-        {0,1,2},
-        {3,4,5},
-        {6,7,8},
-        {0,3,6},
-        {1,4,7},
-        {2,5,8},
-        {0,4,8},
-        {2,4,6}
-    };
-
-    for (auto& combo : combinations) {
-        if (
-            game.board[combo[0]] == symbol &&
-            game.board[combo[1]] == symbol &&
-            game.board[combo[2]] == symbol
-        ) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool ticTacToeBoardFull(TicTacToeGame& game) {
-    for (char cell : game.board) {
-        if (cell == ' ')
-            return false;
-    }
-
-    return true;
 }
 
 
@@ -6124,6 +5962,17 @@ void handleCommand(Client& client, const string& line) {
     }
 
 
+    if (workingLine == "USERS_REQUEST") {
+        string roster;
+        for (const Client& user : clients) {
+            if (user.name.empty()) continue;
+            if (!roster.empty()) roster += "|";
+            roster += user.name;
+        }
+        sendPacket(client.socket, "USERS_LIST", roster);
+        return;
+    }
+
     // --------------------------------------------------------
     // NORMAL CHAT
     // --------------------------------------------------------
@@ -6168,103 +6017,6 @@ void handleCommand(Client& client, const string& line) {
             "SYS",
             result
         );
-    }
-
-
-    // --------------------------------------------------------
-    // /ttt <username>
-    // --------------------------------------------------------
-
-    else if (command == "/ttt") {
-        string targetName;
-        ss >> targetName;
-
-        if (targetName.empty()) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "Usage: /ttt <username>"
-            );
-            return;
-        }
-
-        if (isPlayerBusy(client.socket)) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You are already in a game."
-            );
-            return;
-        }
-
-        Client* target = getClientByName(targetName);
-
-        if (!target) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "User not found."
-            );
-            return;
-        }
-
-        if (target->socket == client.socket) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You cannot challenge yourself."
-            );
-            return;
-        }
-
-        if (isPlayerBusy(target->socket)) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                target->name +
-                " is already playing."
-            );
-            return;
-        }
-
-        if (target->pendingChallenge != INVALID_SOCK) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                target->name +
-                " already has a pending challenge."
-            );
-            return;
-        }
-
-        target->pendingChallenge = client.socket;
-        target->pendingGame = "ttt";
-        target->pendingChips = 0;
-        target->pendingHands = 0;
-
-        sendPacket(
-            client.socket,
-            "GAME",
-            "Tic-Tac-Toe challenge sent to " +
-            target->name +
-            "."
-        );
-
-        sendPacket(
-            target->socket,
-            "GAME",
-            "*** " +
-            client.name +
-            " challenged you to Tic-Tac-Toe! ***"
-        );
-
-        sendPacket(
-            target->socket,
-            "GAME",
-            "Type /accept or /decline"
-        );
-
-        sendReady(target->socket);
     }
 
 
@@ -7303,35 +7055,7 @@ void handleCommand(Client& client, const string& line) {
 
         clearPendingChallenge(client);
 
-        if (gameType == "ttt") {
-            TicTacToeGame game;
-            game.playerX = challengerSocket;
-            game.playerO = accepterSocket;
-            game.turn = challengerSocket;
-
-            ticTacToeGames.push_back(game);
-
-            sendPacket(
-                challengerSocket,
-                "GAME",
-                client.name +
-                " accepted your Tic-Tac-Toe challenge!"
-            );
-
-            sendPacket(
-                accepterSocket,
-                "GAME",
-                "Challenge accepted!"
-            );
-
-            showTicTacToeBoard(
-                ticTacToeGames.back()
-            );
-
-            sendReady(challengerSocket);
-            sendReady(accepterSocket);
-        }
-        else if (gameType == "chess") {
+        if (gameType == "chess") {
             ChessGame game = makeChessGame(
                 challengerSocket,
                 accepterSocket
@@ -7398,7 +7122,7 @@ void handleCommand(Client& client, const string& line) {
         else if (client.pendingGame == "arena")
             gameName = "JENG Arena";
         else
-            gameName = "Tic-Tac-Toe";
+            gameName = "Game";
 
         if (challenger) {
             if (client.pendingGame == "blackjack") {
@@ -7487,7 +7211,6 @@ void handleCommand(Client& client, const string& line) {
 
     // --------------------------------------------------------
     // /move
-    // Tic-Tac-Toe: /move <1-9>
     // Chess:       /move <from> <to> [promotion]
     // --------------------------------------------------------
 
@@ -7523,127 +7246,7 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        int position;
-
-        if (!(ss >> position)) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "Tic-Tac-Toe: /move <1-9> | Chess: /move e2 e4"
-            );
-            return;
-        }
-
-        int gameIndex = findTicTacToeGame(
-            client.socket
-        );
-
-        if (gameIndex == -1) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You are not in a Tic-Tac-Toe or Chess game."
-            );
-            return;
-        }
-
-        TicTacToeGame& game =
-            ticTacToeGames[gameIndex];
-
-        if (game.turn != client.socket) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "It is not your turn."
-            );
-            return;
-        }
-
-        if (position < 1 || position > 9) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "Position must be 1 through 9."
-            );
-            return;
-        }
-
-        int index = position - 1;
-
-        if (game.board[index] != ' ') {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "That square is already taken."
-            );
-            return;
-        }
-
-        char symbol =
-            client.socket == game.playerX
-            ? 'X'
-            : 'O';
-
-        game.board[index] = symbol;
-
-        if (ticTacToeWinner(game, symbol)) {
-            Socket playerX = game.playerX;
-            Socket playerO = game.playerO;
-
-            showTicTacToeBoard(
-                game,
-                false
-            );
-
-            sendTicTacToeLine(
-                game,
-                "*** " +
-                client.name +
-                " WINS! ***"
-            );
-
-            sendReady(playerX);
-            sendReady(playerO);
-
-            ticTacToeGames.erase(
-                ticTacToeGames.begin() + gameIndex
-            );
-
-            return;
-        }
-
-        if (ticTacToeBoardFull(game)) {
-            Socket playerX = game.playerX;
-            Socket playerO = game.playerO;
-
-            showTicTacToeBoard(
-                game,
-                false
-            );
-
-            sendTicTacToeLine(
-                game,
-                "*** DRAW! ***"
-            );
-
-            sendReady(playerX);
-            sendReady(playerO);
-
-            ticTacToeGames.erase(
-                ticTacToeGames.begin() + gameIndex
-            );
-
-            return;
-        }
-
-        game.turn =
-            game.turn == game.playerX
-            ? game.playerO
-            : game.playerX;
-
-        showTicTacToeBoard(game);
-        sendReady(game.playerX);
-        sendReady(game.playerO);
+        sendPacket(client.socket, "CHESS_ERROR", "You are not in a Chess game.");
     }
 
     // --------------------------------------------------------
@@ -7662,23 +7265,7 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        int gameIndex = findTicTacToeGame(
-            client.socket
-        );
-
-        if (gameIndex == -1) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You are not currently playing Tic-Tac-Toe or Chess."
-            );
-            return;
-        }
-
-        TicTacToeGame& game = ticTacToeGames[gameIndex];
-        showTicTacToeBoard(game);
-        sendReady(game.playerX);
-        sendReady(game.playerO);
+        sendPacket(client.socket, "CHESS_ERROR", "You are not in a Chess game.");
     }
 
     // --------------------------------------------------------
@@ -8407,44 +7994,6 @@ void handleCommand(Client& client, const string& line) {
     // --------------------------------------------------------
 
     else if (command == "/resign") {
-        int ticTacToeIndex = findTicTacToeGame(
-            client.socket
-        );
-
-        if (ticTacToeIndex != -1) {
-            TicTacToeGame& game =
-                ticTacToeGames[ticTacToeIndex];
-
-            Socket opponent =
-                game.playerX == client.socket
-                ? game.playerO
-                : game.playerX;
-
-            Socket playerX = game.playerX;
-            Socket playerO = game.playerO;
-
-            sendTicTacToeLine(
-                game,
-                client.name +
-                " resigned."
-            );
-
-            sendTicTacToeLine(
-                game,
-                getName(opponent) +
-                " wins!"
-            );
-
-            sendReady(playerX);
-            sendReady(playerO);
-
-            ticTacToeGames.erase(
-                ticTacToeGames.begin() + ticTacToeIndex
-            );
-
-            return;
-        }
-
         int chessIndex = findChessGame(
             client.socket
         );
@@ -8652,12 +8201,6 @@ void handleCommand(Client& client, const string& line) {
         sendPacket(client.socket, "SYS", "/users");
         sendPacket(client.socket, "SYS", "/quit");
         sendPacket(client.socket, "SYS", "");
-        sendPacket(client.socket, "SYS", "TIC-TAC-TOE");
-        sendPacket(client.socket, "SYS", "/ttt <username>");
-        sendPacket(client.socket, "SYS", "/move <1-9>");
-        sendPacket(client.socket, "SYS", "/board");
-        sendPacket(client.socket, "SYS", "/resign");
-        sendPacket(client.socket, "SYS", "");
         sendPacket(client.socket, "SYS", "CHESS");
         sendPacket(client.socket, "SYS", "/chess <username>");
         sendPacket(client.socket, "SYS", "/board");
@@ -8751,31 +8294,6 @@ void disconnectClient(int index) {
 
             sendReady(challenger->socket);
         }
-    }
-
-    int ticTacToeIndex = findTicTacToeGame(socket);
-
-    if (ticTacToeIndex != -1) {
-        TicTacToeGame game =
-            ticTacToeGames[ticTacToeIndex];
-
-        Socket opponent =
-            game.playerX == socket
-            ? game.playerO
-            : game.playerX;
-
-        sendPacket(
-            opponent,
-            "GAME",
-            name +
-            " disconnected. Tic-Tac-Toe ended."
-        );
-
-        sendReady(opponent);
-
-        ticTacToeGames.erase(
-            ticTacToeGames.begin() + ticTacToeIndex
-        );
     }
 
     int chessIndex = findChessGame(socket);
@@ -9185,7 +8703,7 @@ int main() {
     cout << "        JENG CHAT SERVER\n";
     cout << "================================\n";
     cout << "Port: " << PORT << "\n";
-    cout << "Games: Tic-Tac-Toe + Blackjack + Chess + Poker + Roulette + JENG Arena\n";
+    cout << "Games: Blackjack + Chess + Poker + Roulette + JENG Arena\n";
     cout << "Waiting for players...\n\n";
 
     while (true) {

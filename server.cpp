@@ -319,6 +319,7 @@ struct ArenaPlayer {
 struct ArenaGame {
     Socket host = INVALID_SOCK;
     string mode = "SCORE_FFA";
+    string map = "REACTOR_YARD";
     int maxPlayers = 4;
     int scoreLimit = 5;
     int timeLimitSeconds = 180;
@@ -3476,6 +3477,38 @@ bool validArenaMode(const string& mode) {
         mode == "TEAM_3V3";
 }
 
+
+bool validArenaMap(const string& map) {
+    return
+        map == "REACTOR_YARD" ||
+        map == "ALIEN_OUTPOST";
+}
+
+float arenaHalf(const ArenaGame& game) {
+    return
+        game.map == "ALIEN_OUTPOST"
+        ? 30.0f
+        : ARENA_HALF;
+}
+
+float arenaProjectileBoundary(const ArenaGame& game) {
+    return arenaHalf(game) + 0.5f;
+}
+
+float arenaSafeSpawnDistance(const ArenaGame& game) {
+    return
+        game.map == "ALIEN_OUTPOST"
+        ? 8.0f
+        : 7.0f;
+}
+
+string arenaStateModeToken(const ArenaGame& game) {
+    return
+        game.mode +
+        "@" +
+        game.map;
+}
+
 int normalizeArenaPlayerCount(const string& mode, int requested) {
     if (mode == "DUEL")
         return 2;
@@ -3565,7 +3598,7 @@ string encodeArenaPlayer(const ArenaPlayer& player) {
 void sendArenaState(ArenaGame& game) {
     string payload =
         game.phase + "|" +
-        game.mode + "|" +
+        arenaStateModeToken(game) + "|" +
         to_string(game.maxPlayers) + "|" +
         to_string(game.scoreLimit) + "|" +
         to_string(game.timeLimitSeconds) + "|" +
@@ -3646,17 +3679,49 @@ bool arenaCircleHitsBox(
         ARENA_TANK_RADIUS * ARENA_TANK_RADIUS;
 }
 
-bool arenaPositionBlocked(float x, float z) {
+bool arenaPositionBlocked(
+    const ArenaGame& game,
+    float x,
+    float z
+) {
+    const float half =
+        arenaHalf(game);
+
     if (
-        x < -ARENA_HALF + ARENA_TANK_RADIUS ||
-        x >  ARENA_HALF - ARENA_TANK_RADIUS ||
-        z < -ARENA_HALF + ARENA_TANK_RADIUS ||
-        z >  ARENA_HALF - ARENA_TANK_RADIUS
+        x < -half + ARENA_TANK_RADIUS ||
+        x >  half - ARENA_TANK_RADIUS ||
+        z < -half + ARENA_TANK_RADIUS ||
+        z >  half - ARENA_TANK_RADIUS
     ) {
         return true;
     }
 
-    static const ArenaObstacle2D obstacles[] = {
+    if (game.map == "ALIEN_OUTPOST") {
+        static const ArenaObstacle2D alienObstacles[] = {
+            {-4.2f,  -4.2f,   4.2f,   4.2f},
+            {-25.0f, -3.0f, -19.0f,   3.0f},
+            { 19.0f, -3.0f,  25.0f,   3.0f},
+            {-3.0f, -25.0f,   3.0f, -19.0f},
+            {-3.0f,  19.0f,   3.0f,  25.0f},
+            {-20.5f,-20.5f, -14.0f, -14.0f},
+            { 14.0f,-20.5f,  20.5f, -14.0f},
+            {-20.5f, 14.0f, -14.0f,  20.5f},
+            { 14.0f, 14.0f,  20.5f,  20.5f},
+            {-12.0f, -8.5f,  -8.0f,  -4.0f},
+            {  8.0f,  4.0f,  12.0f,   8.5f},
+            {-12.0f,  4.0f,  -8.0f,   8.5f},
+            {  8.0f, -8.5f,  12.0f,  -4.0f}
+        };
+
+        for (const ArenaObstacle2D& obstacle : alienObstacles) {
+            if (arenaCircleHitsBox(x, z, obstacle))
+                return true;
+        }
+
+        return false;
+    }
+
+    static const ArenaObstacle2D reactorObstacles[] = {
         {-4.5f,  -4.5f,   4.5f,   4.5f},
         {-20.0f, -2.2f, -15.0f,   2.2f},
         { 15.0f, -2.2f,  20.0f,   2.2f},
@@ -3668,7 +3733,7 @@ bool arenaPositionBlocked(float x, float z) {
         { 12.0f, 12.0f,  17.0f,  17.0f}
     };
 
-    for (const ArenaObstacle2D& obstacle : obstacles) {
+    for (const ArenaObstacle2D& obstacle : reactorObstacles) {
         if (arenaCircleHitsBox(x, z, obstacle))
             return true;
     }
@@ -3743,6 +3808,24 @@ static const float ARENA_BLUE_SPAWNS[4][2] = {
     {22.0f, 5.0f}, {21.0f, 16.0f}
 };
 
+
+static const float ALIEN_FFA_SPAWNS[8][2] = {
+    {-26.0f,  26.0f}, { 0.0f,  27.0f},
+    { 26.0f,  26.0f}, {27.0f,   0.0f},
+    { 26.0f, -26.0f}, { 0.0f, -27.0f},
+    {-26.0f, -26.0f}, {-27.0f,  0.0f}
+};
+
+static const float ALIEN_RED_SPAWNS[4][2] = {
+    {-26.0f, 20.0f}, {-27.0f, 7.0f},
+    {-27.0f, -7.0f}, {-26.0f, -20.0f}
+};
+
+static const float ALIEN_BLUE_SPAWNS[4][2] = {
+    {26.0f, -20.0f}, {27.0f, -7.0f},
+    {27.0f, 7.0f}, {26.0f, 20.0f}
+};
+
 bool arenaSpawnIsClear(
     const ArenaGame& game,
     Socket respawningSocket,
@@ -3799,26 +3882,54 @@ void chooseArenaSpawn(
 ) {
     vector<array<float, 2>> candidates;
 
-    if (arenaTeamMode(game.mode)) {
-        const float (*spawns)[2] =
-            player.team == 0
-            ? ARENA_RED_SPAWNS
-            : ARENA_BLUE_SPAWNS;
+    const bool alien =
+        game.map == "ALIEN_OUTPOST";
 
-        for (int i = 0; i < 4; i++)
-            candidates.push_back({spawns[i][0], spawns[i][1]});
+    if (arenaTeamMode(game.mode)) {
+        const float (*spawns)[2] = nullptr;
+
+        if (alien) {
+            spawns =
+                player.team == 0
+                ? ALIEN_RED_SPAWNS
+                : ALIEN_BLUE_SPAWNS;
+        }
+        else {
+            spawns =
+                player.team == 0
+                ? ARENA_RED_SPAWNS
+                : ARENA_BLUE_SPAWNS;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            candidates.push_back({
+                spawns[i][0],
+                spawns[i][1]
+            });
+        }
     }
     else {
-        for (int i = 0; i < 8; i++)
+        const float (*spawns)[2] =
+            alien
+            ? ALIEN_FFA_SPAWNS
+            : ARENA_FFA_SPAWNS;
+
+        for (int i = 0; i < 8; i++) {
             candidates.push_back({
-                ARENA_FFA_SPAWNS[i][0],
-                ARENA_FFA_SPAWNS[i][1]
+                spawns[i][0],
+                spawns[i][1]
             });
+        }
     }
 
-    shuffle(candidates.begin(), candidates.end(), rng);
+    shuffle(
+        candidates.begin(),
+        candidates.end(),
+        rng
+    );
 
-    constexpr float SAFE_SPAWN_DISTANCE = 7.0f;
+    const float safeSpawnDistance =
+        arenaSafeSpawnDistance(game);
 
     for (const auto& spawn : candidates) {
         if (
@@ -3827,7 +3938,12 @@ void chooseArenaSpawn(
                 player.socket,
                 spawn[0],
                 spawn[1],
-                SAFE_SPAWN_DISTANCE
+                safeSpawnDistance
+            ) &&
+            !arenaPositionBlocked(
+                game,
+                spawn[0],
+                spawn[1]
             )
         ) {
             player.spawnX = spawn[0];
@@ -3839,6 +3955,16 @@ void chooseArenaSpawn(
     float bestDistanceSquared = -1.0f;
 
     for (const auto& spawn : candidates) {
+        if (
+            arenaPositionBlocked(
+                game,
+                spawn[0],
+                spawn[1]
+            )
+        ) {
+            continue;
+        }
+
         float distanceSquared =
             arenaNearestLivingPlayerDistanceSquared(
                 game,
@@ -4064,7 +4190,7 @@ void applyArenaInput(
             moveX * ARENA_PLAYER_SPEED * dt;
 
         if (
-            !arenaPositionBlocked(nextX, player.z) &&
+            !arenaPositionBlocked(game, nextX, player.z) &&
             !arenaPositionBlockedByPlayer(
                 game,
                 player.socket,
@@ -4080,7 +4206,7 @@ void applyArenaInput(
             moveZ * ARENA_PLAYER_SPEED * dt;
 
         if (
-            !arenaPositionBlocked(player.x, nextZ) &&
+            !arenaPositionBlocked(game, player.x, nextZ) &&
             !arenaPositionBlockedByPlayer(
                 game,
                 player.socket,
@@ -4186,8 +4312,46 @@ void placeArenaMine(
     game.mines.push_back(mine);
 }
 
-bool arenaProjectileHitsObstacle(const ArenaProjectile& projectile) {
-    static const ArenaObstacle2D obstacles[] = {
+bool arenaProjectileHitsObstacle(
+    const ArenaGame& game,
+    const ArenaProjectile& projectile
+) {
+    auto Hits =
+        [&](const ArenaObstacle2D& obstacle)
+        {
+            return
+                projectile.x + ARENA_BULLET_RADIUS > obstacle.minX &&
+                projectile.x - ARENA_BULLET_RADIUS < obstacle.maxX &&
+                projectile.z + ARENA_BULLET_RADIUS > obstacle.minZ &&
+                projectile.z - ARENA_BULLET_RADIUS < obstacle.maxZ;
+        };
+
+    if (game.map == "ALIEN_OUTPOST") {
+        static const ArenaObstacle2D alienObstacles[] = {
+            {-4.2f,  -4.2f,   4.2f,   4.2f},
+            {-25.0f, -3.0f, -19.0f,   3.0f},
+            { 19.0f, -3.0f,  25.0f,   3.0f},
+            {-3.0f, -25.0f,   3.0f, -19.0f},
+            {-3.0f,  19.0f,   3.0f,  25.0f},
+            {-20.5f,-20.5f, -14.0f, -14.0f},
+            { 14.0f,-20.5f,  20.5f, -14.0f},
+            {-20.5f, 14.0f, -14.0f,  20.5f},
+            { 14.0f, 14.0f,  20.5f,  20.5f},
+            {-12.0f, -8.5f,  -8.0f,  -4.0f},
+            {  8.0f,  4.0f,  12.0f,   8.5f},
+            {-12.0f,  4.0f,  -8.0f,   8.5f},
+            {  8.0f, -8.5f,  12.0f,  -4.0f}
+        };
+
+        for (const ArenaObstacle2D& obstacle : alienObstacles) {
+            if (Hits(obstacle))
+                return true;
+        }
+
+        return false;
+    }
+
+    static const ArenaObstacle2D reactorObstacles[] = {
         {-4.5f,  -4.5f,   4.5f,   4.5f},
         {-20.0f, -2.2f, -15.0f,   2.2f},
         { 15.0f, -2.2f,  20.0f,   2.2f},
@@ -4199,15 +4363,9 @@ bool arenaProjectileHitsObstacle(const ArenaProjectile& projectile) {
         { 12.0f, 12.0f,  17.0f,  17.0f}
     };
 
-    for (const ArenaObstacle2D& obstacle : obstacles) {
-        if (
-            projectile.x + ARENA_BULLET_RADIUS > obstacle.minX &&
-            projectile.x - ARENA_BULLET_RADIUS < obstacle.maxX &&
-            projectile.z + ARENA_BULLET_RADIUS > obstacle.minZ &&
-            projectile.z - ARENA_BULLET_RADIUS < obstacle.maxZ
-        ) {
+    for (const ArenaObstacle2D& obstacle : reactorObstacles) {
+        if (Hits(obstacle))
             return true;
-        }
     }
 
     return false;
@@ -4270,15 +4428,23 @@ void updateArenaProjectiles(
         projectile.x += projectile.vx * dt;
         projectile.z += projectile.vz * dt;
 
+        const float projectileBoundary =
+            arenaProjectileBoundary(game);
+
         if (
-            fabs(projectile.x) > 22.0f ||
-            fabs(projectile.z) > 22.0f
+            fabs(projectile.x) > projectileBoundary ||
+            fabs(projectile.z) > projectileBoundary
         ) {
             projectile.active = false;
             continue;
         }
 
-        if (arenaProjectileHitsObstacle(projectile)) {
+        if (
+            arenaProjectileHitsObstacle(
+                game,
+                projectile
+            )
+        ) {
             projectile.active = false;
             continue;
         }
@@ -5239,6 +5405,11 @@ void handleCommand(Client& client, const string& line) {
         }
 
         string mode = fields[0];
+        string map =
+            fields.size() >= 6
+            ? fields[5]
+            : "REACTOR_YARD";
+
         int requestedPlayers = 0;
         int scoreLimit = 0;
         int timeLimit = 0;
@@ -5246,6 +5417,7 @@ void handleCommand(Client& client, const string& line) {
 
         if (
             !validArenaMode(mode) ||
+            !validArenaMap(map) ||
             !parseArenaInt(fields[1], requestedPlayers) ||
             !parseArenaInt(fields[2], scoreLimit) ||
             !parseArenaInt(fields[3], timeLimit) ||
@@ -5302,11 +5474,19 @@ void handleCommand(Client& client, const string& line) {
         ArenaGame game;
         game.host = client.socket;
         game.mode = mode;
+        game.map = map;
         game.maxPlayers = maxPlayers;
         game.scoreLimit = scoreLimit;
         game.timeLimitSeconds = timeLimit;
         game.phase = "LOBBY";
-        game.status = "Arena lobby created. Invite players.";
+        game.status =
+            string("Arena lobby created on ") +
+            (
+                game.map == "ALIEN_OUTPOST"
+                ? "Alien Outpost"
+                : "Reactor Yard"
+            ) +
+            ". Invite players.";
 
         ArenaPlayer host;
         host.socket = client.socket;
@@ -5609,7 +5789,12 @@ void handleCommand(Client& client, const string& line) {
 
         game.phase = "PLAYING";
         game.status =
-            "Online combat active.";
+            string("Online combat active - ") +
+            (
+                game.map == "ALIEN_OUTPOST"
+                ? "Alien Outpost."
+                : "Reactor Yard."
+            );
 
         initializeArenaWorld(game);
 

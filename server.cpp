@@ -1,17 +1,3 @@
-#include "accounts.h"
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/crypto.h>
-#include <deque>
-#include <map>
-#include <future>
-#include <memory>
-#include <thread>
-#ifndef _WIN32
-#include <fcntl.h>
-#include <netinet/tcp.h>
-#include <sys/stat.h>
-#endif
 #include <iostream>
 #include <vector>
 #include <string>
@@ -112,20 +98,24 @@ struct Client {
     Socket socket;
     string name;
     string inputBuffer;
-    SSL* tls = nullptr;
-    bool tlsReady = false;
-    bool closeRequested = false;
-    string peerIP;
-    std::deque<string> output;
-    size_t outputBytes = 0;
-    std::chrono::steady_clock::time_point connectedAt = std::chrono::steady_clock::now();
-    std::shared_future<AccountResult> auth;
-
 
     Socket pendingChallenge = INVALID_SOCK;
     string pendingGame;
     int pendingChips = 0;
     int pendingHands = 0;
+};
+
+struct TicTacToeGame {
+    Socket playerX;
+    Socket playerO;
+
+    char board[9] = {
+        ' ', ' ', ' ',
+        ' ', ' ', ' ',
+        ' ', ' ', ' '
+    };
+
+    Socket turn;
 };
 
 struct Card {
@@ -354,6 +344,7 @@ struct ArenaGame {
 };
 
 vector<Client> clients;
+vector<TicTacToeGame> ticTacToeGames;
 vector<BlackjackGame> blackjackGames;
 vector<ChessGame> chessGames;
 vector<PokerGame> pokerGames;
@@ -368,18 +359,23 @@ static mt19937 rng(random_device{}());
 // ============================================================
 
 bool sendAll(Socket socket, const string& data) {
-    for (Client& c : clients) {
-        if (c.socket != socket) continue;
-        if (!c.tlsReady || c.closeRequested) return false;
-        if (c.outputBytes + data.size() > 2 * 1024 * 1024) {
-            c.closeRequested = true;
+    int total = 0;
+
+    while (total < (int)data.size()) {
+        int sent = send(
+            socket,
+            data.c_str() + total,
+            (int)data.size() - total,
+            0
+        );
+
+        if (sent == SOCKET_ERR || sent == 0)
             return false;
-        }
-        c.output.push_back(data);
-        c.outputBytes += data.size();
-        return true;
+
+        total += sent;
     }
-    return false;
+
+    return true;
 }
 
 void sendPacket(
@@ -492,6 +488,19 @@ void broadcastChat(
 // GAME LOOKUPS
 // ============================================================
 
+int findTicTacToeGame(Socket socket) {
+    for (int i = 0; i < (int)ticTacToeGames.size(); i++) {
+        if (
+            ticTacToeGames[i].playerX == socket ||
+            ticTacToeGames[i].playerO == socket
+        ) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 int findBlackjackGame(Socket socket) {
     for (int i = 0; i < (int)blackjackGames.size(); i++) {
         for (const BlackjackPlayer& player : blackjackGames[i].players) {
@@ -550,11 +559,146 @@ int findArenaGame(Socket socket) {
 
 bool isPlayerBusy(Socket socket) {
     return
+        findTicTacToeGame(socket) != -1 ||
         findBlackjackGame(socket) != -1 ||
         findChessGame(socket) != -1 ||
         findPokerGame(socket) != -1 ||
         findRouletteGame(socket) != -1 ||
         findArenaGame(socket) != -1;
+}
+
+
+// ============================================================
+// TIC-TAC-TOE
+// ============================================================
+
+void sendTicTacToeLine(
+    TicTacToeGame& game,
+    const string& text
+) {
+    sendPacket(
+        game.playerX,
+        "GAME",
+        text
+    );
+
+    sendPacket(
+        game.playerO,
+        "GAME",
+        text
+    );
+}
+
+char displayCell(TicTacToeGame& game, int index) {
+    if (game.board[index] != ' ')
+        return game.board[index];
+
+    return '1' + index;
+}
+
+void showTicTacToeBoard(
+    TicTacToeGame& game,
+    bool showTurn = true
+) {
+    sendTicTacToeLine(game, "");
+    sendTicTacToeLine(game, "========== TIC-TAC-TOE ==========");
+
+    sendTicTacToeLine(
+        game,
+        getName(game.playerX) +
+        " (X) vs " +
+        getName(game.playerO) +
+        " (O)"
+    );
+
+    sendTicTacToeLine(game, "");
+
+    string row1;
+    row1 += " ";
+    row1 += displayCell(game, 0);
+    row1 += " | ";
+    row1 += displayCell(game, 1);
+    row1 += " | ";
+    row1 += displayCell(game, 2);
+
+    string row2;
+    row2 += " ";
+    row2 += displayCell(game, 3);
+    row2 += " | ";
+    row2 += displayCell(game, 4);
+    row2 += " | ";
+    row2 += displayCell(game, 5);
+
+    string row3;
+    row3 += " ";
+    row3 += displayCell(game, 6);
+    row3 += " | ";
+    row3 += displayCell(game, 7);
+    row3 += " | ";
+    row3 += displayCell(game, 8);
+
+    sendTicTacToeLine(game, row1);
+    sendTicTacToeLine(game, "---+---+---");
+    sendTicTacToeLine(game, row2);
+    sendTicTacToeLine(game, "---+---+---");
+    sendTicTacToeLine(game, row3);
+    sendTicTacToeLine(game, "");
+
+    if (showTurn) {
+        string symbol =
+            game.turn == game.playerX
+            ? "X"
+            : "O";
+
+        sendTicTacToeLine(
+            game,
+            "Turn: " +
+            getName(game.turn) +
+            " (" +
+            symbol +
+            ")"
+        );
+    }
+
+    sendTicTacToeLine(game, "================================");
+    sendTicTacToeLine(game, "");
+}
+
+bool ticTacToeWinner(
+    TicTacToeGame& game,
+    char symbol
+) {
+    int combinations[8][3] = {
+        {0,1,2},
+        {3,4,5},
+        {6,7,8},
+        {0,3,6},
+        {1,4,7},
+        {2,5,8},
+        {0,4,8},
+        {2,4,6}
+    };
+
+    for (auto& combo : combinations) {
+        if (
+            game.board[combo[0]] == symbol &&
+            game.board[combo[1]] == symbol &&
+            game.board[combo[2]] == symbol
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ticTacToeBoardFull(TicTacToeGame& game) {
+    for (char cell : game.board) {
+        if (cell == ' ')
+            return false;
+    }
+
+    return true;
 }
 
 
@@ -6082,17 +6226,6 @@ void handleCommand(Client& client, const string& line) {
     }
 
 
-    if (workingLine == "USERS_REQUEST") {
-        string roster;
-        for (const Client& user : clients) {
-            if (user.name.empty()) continue;
-            if (!roster.empty()) roster += "|";
-            roster += user.name;
-        }
-        sendPacket(client.socket, "USERS_LIST", roster);
-        return;
-    }
-
     // --------------------------------------------------------
     // NORMAL CHAT
     // --------------------------------------------------------
@@ -6137,6 +6270,103 @@ void handleCommand(Client& client, const string& line) {
             "SYS",
             result
         );
+    }
+
+
+    // --------------------------------------------------------
+    // /ttt <username>
+    // --------------------------------------------------------
+
+    else if (command == "/ttt") {
+        string targetName;
+        ss >> targetName;
+
+        if (targetName.empty()) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "Usage: /ttt <username>"
+            );
+            return;
+        }
+
+        if (isPlayerBusy(client.socket)) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "You are already in a game."
+            );
+            return;
+        }
+
+        Client* target = getClientByName(targetName);
+
+        if (!target) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "User not found."
+            );
+            return;
+        }
+
+        if (target->socket == client.socket) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "You cannot challenge yourself."
+            );
+            return;
+        }
+
+        if (isPlayerBusy(target->socket)) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                target->name +
+                " is already playing."
+            );
+            return;
+        }
+
+        if (target->pendingChallenge != INVALID_SOCK) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                target->name +
+                " already has a pending challenge."
+            );
+            return;
+        }
+
+        target->pendingChallenge = client.socket;
+        target->pendingGame = "ttt";
+        target->pendingChips = 0;
+        target->pendingHands = 0;
+
+        sendPacket(
+            client.socket,
+            "GAME",
+            "Tic-Tac-Toe challenge sent to " +
+            target->name +
+            "."
+        );
+
+        sendPacket(
+            target->socket,
+            "GAME",
+            "*** " +
+            client.name +
+            " challenged you to Tic-Tac-Toe! ***"
+        );
+
+        sendPacket(
+            target->socket,
+            "GAME",
+            "Type /accept or /decline"
+        );
+
+        sendReady(target->socket);
     }
 
 
@@ -7177,7 +7407,35 @@ void handleCommand(Client& client, const string& line) {
 
         clearPendingChallenge(client);
 
-        if (gameType == "chess") {
+        if (gameType == "ttt") {
+            TicTacToeGame game;
+            game.playerX = challengerSocket;
+            game.playerO = accepterSocket;
+            game.turn = challengerSocket;
+
+            ticTacToeGames.push_back(game);
+
+            sendPacket(
+                challengerSocket,
+                "GAME",
+                client.name +
+                " accepted your Tic-Tac-Toe challenge!"
+            );
+
+            sendPacket(
+                accepterSocket,
+                "GAME",
+                "Challenge accepted!"
+            );
+
+            showTicTacToeBoard(
+                ticTacToeGames.back()
+            );
+
+            sendReady(challengerSocket);
+            sendReady(accepterSocket);
+        }
+        else if (gameType == "chess") {
             ChessGame game = makeChessGame(
                 challengerSocket,
                 accepterSocket
@@ -7244,7 +7502,7 @@ void handleCommand(Client& client, const string& line) {
         else if (client.pendingGame == "arena")
             gameName = "JENG Arena";
         else
-            gameName = "Game";
+            gameName = "Tic-Tac-Toe";
 
         if (challenger) {
             if (client.pendingGame == "blackjack") {
@@ -7333,6 +7591,7 @@ void handleCommand(Client& client, const string& line) {
 
     // --------------------------------------------------------
     // /move
+    // Tic-Tac-Toe: /move <1-9>
     // Chess:       /move <from> <to> [promotion]
     // --------------------------------------------------------
 
@@ -7368,7 +7627,127 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        sendPacket(client.socket, "CHESS_ERROR", "You are not in a Chess game.");
+        int position;
+
+        if (!(ss >> position)) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "Tic-Tac-Toe: /move <1-9> | Chess: /move e2 e4"
+            );
+            return;
+        }
+
+        int gameIndex = findTicTacToeGame(
+            client.socket
+        );
+
+        if (gameIndex == -1) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "You are not in a Tic-Tac-Toe or Chess game."
+            );
+            return;
+        }
+
+        TicTacToeGame& game =
+            ticTacToeGames[gameIndex];
+
+        if (game.turn != client.socket) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "It is not your turn."
+            );
+            return;
+        }
+
+        if (position < 1 || position > 9) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "Position must be 1 through 9."
+            );
+            return;
+        }
+
+        int index = position - 1;
+
+        if (game.board[index] != ' ') {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "That square is already taken."
+            );
+            return;
+        }
+
+        char symbol =
+            client.socket == game.playerX
+            ? 'X'
+            : 'O';
+
+        game.board[index] = symbol;
+
+        if (ticTacToeWinner(game, symbol)) {
+            Socket playerX = game.playerX;
+            Socket playerO = game.playerO;
+
+            showTicTacToeBoard(
+                game,
+                false
+            );
+
+            sendTicTacToeLine(
+                game,
+                "*** " +
+                client.name +
+                " WINS! ***"
+            );
+
+            sendReady(playerX);
+            sendReady(playerO);
+
+            ticTacToeGames.erase(
+                ticTacToeGames.begin() + gameIndex
+            );
+
+            return;
+        }
+
+        if (ticTacToeBoardFull(game)) {
+            Socket playerX = game.playerX;
+            Socket playerO = game.playerO;
+
+            showTicTacToeBoard(
+                game,
+                false
+            );
+
+            sendTicTacToeLine(
+                game,
+                "*** DRAW! ***"
+            );
+
+            sendReady(playerX);
+            sendReady(playerO);
+
+            ticTacToeGames.erase(
+                ticTacToeGames.begin() + gameIndex
+            );
+
+            return;
+        }
+
+        game.turn =
+            game.turn == game.playerX
+            ? game.playerO
+            : game.playerX;
+
+        showTicTacToeBoard(game);
+        sendReady(game.playerX);
+        sendReady(game.playerO);
     }
 
     // --------------------------------------------------------
@@ -7387,7 +7766,23 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        sendPacket(client.socket, "CHESS_ERROR", "You are not in a Chess game.");
+        int gameIndex = findTicTacToeGame(
+            client.socket
+        );
+
+        if (gameIndex == -1) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "You are not currently playing Tic-Tac-Toe or Chess."
+            );
+            return;
+        }
+
+        TicTacToeGame& game = ticTacToeGames[gameIndex];
+        showTicTacToeBoard(game);
+        sendReady(game.playerX);
+        sendReady(game.playerO);
     }
 
     // --------------------------------------------------------
@@ -8104,6 +8499,44 @@ void handleCommand(Client& client, const string& line) {
     // --------------------------------------------------------
 
     else if (command == "/resign") {
+        int ticTacToeIndex = findTicTacToeGame(
+            client.socket
+        );
+
+        if (ticTacToeIndex != -1) {
+            TicTacToeGame& game =
+                ticTacToeGames[ticTacToeIndex];
+
+            Socket opponent =
+                game.playerX == client.socket
+                ? game.playerO
+                : game.playerX;
+
+            Socket playerX = game.playerX;
+            Socket playerO = game.playerO;
+
+            sendTicTacToeLine(
+                game,
+                client.name +
+                " resigned."
+            );
+
+            sendTicTacToeLine(
+                game,
+                getName(opponent) +
+                " wins!"
+            );
+
+            sendReady(playerX);
+            sendReady(playerO);
+
+            ticTacToeGames.erase(
+                ticTacToeGames.begin() + ticTacToeIndex
+            );
+
+            return;
+        }
+
         int chessIndex = findChessGame(
             client.socket
         );
@@ -8295,6 +8728,12 @@ void handleCommand(Client& client, const string& line) {
         sendPacket(client.socket, "SYS", "/users");
         sendPacket(client.socket, "SYS", "/quit");
         sendPacket(client.socket, "SYS", "");
+        sendPacket(client.socket, "SYS", "TIC-TAC-TOE");
+        sendPacket(client.socket, "SYS", "/ttt <username>");
+        sendPacket(client.socket, "SYS", "/move <1-9>");
+        sendPacket(client.socket, "SYS", "/board");
+        sendPacket(client.socket, "SYS", "/resign");
+        sendPacket(client.socket, "SYS", "");
         sendPacket(client.socket, "SYS", "CHESS");
         sendPacket(client.socket, "SYS", "/chess <username>");
         sendPacket(client.socket, "SYS", "/board");
@@ -8388,6 +8827,31 @@ void disconnectClient(int index) {
 
             sendReady(challenger->socket);
         }
+    }
+
+    int ticTacToeIndex = findTicTacToeGame(socket);
+
+    if (ticTacToeIndex != -1) {
+        TicTacToeGame game =
+            ticTacToeGames[ticTacToeIndex];
+
+        Socket opponent =
+            game.playerX == socket
+            ? game.playerO
+            : game.playerX;
+
+        sendPacket(
+            opponent,
+            "GAME",
+            name +
+            " disconnected. Tic-Tac-Toe ended."
+        );
+
+        sendReady(opponent);
+
+        ticTacToeGames.erase(
+            ticTacToeGames.begin() + ticTacToeIndex
+        );
     }
 
     int chessIndex = findChessGame(socket);
@@ -8712,8 +9176,6 @@ void disconnectClient(int index) {
         }
     }
 
-    if (clients[index].tls) SSL_free(clients[index].tls);
-    OPENSSL_cleanse(clients[index].inputBuffer.data(), clients[index].inputBuffer.size());
     CLOSE_SOCKET(socket);
 
     clients.erase(
@@ -8738,206 +9200,235 @@ void disconnectClient(int index) {
 // MAIN
 // ============================================================
 
-
-namespace {
-    bool makeNonblocking(Socket socket) {
-#ifdef _WIN32
-        u_long one = 1;
-        return ioctlsocket(socket, FIONBIO, &one) == 0;
-#else
-        int flags = fcntl(socket, F_GETFL, 0);
-        return flags >= 0 && fcntl(socket, F_SETFL, flags | O_NONBLOCK) == 0;
-#endif
-    }
-    bool tlsRetry(SSL* ssl, int result) {
-        int error = SSL_get_error(ssl, result);
-        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
-    }
-    struct Limit { int count = 0; chrono::steady_clock::time_point start = chrono::steady_clock::now(); };
-    map<string, Limit> authLimits;
-    bool allowAuth(const string& key, int maximum) {
-        auto now = chrono::steady_clock::now();
-        auto& limit = authLimits[key];
-        if (now - limit.start >= chrono::minutes(1)) limit = {0, now};
-        return ++limit.count <= maximum;
-    }
-    void authenticate(Client& c, string& line, Accounts& accounts) {
-        if (c.auth.valid()) return;
-        // Hex encoding avoids protocol delimiters in passwords; TLS supplies confidentiality.
-        auto first = line.find('|');
-        auto second = first == string::npos ? string::npos : line.find('|', first + 1);
-        string operation = line.substr(0, first);
-        if (second == string::npos || (operation != "AUTH_LOGIN" && operation != "AUTH_REGISTER")) {
-            sendPacket(c.socket, "AUTH_ERROR", "Please sign in with an updated JengChat client.");
-            return;
-        }
-        string name = line.substr(first + 1, second - first - 1);
-        if (!ValidAccountName(name)) {
-            sendPacket(c.socket, "AUTH_ERROR", "Username: 3-16 letters, numbers, underscores or hyphens.");
-            return;
-        }
-        if (!allowAuth("ip:" + c.peerIP, 20) || !allowAuth("user:" + lowerCopy(name), 6)) {
-            sendPacket(c.socket, "AUTH_ERROR", "Too many attempts. Wait one minute and retry.");
-            return;
-        }
-        string encoded = line.substr(second + 1), password;
-        auto nibble = [](char ch) -> int {
-            if (ch >= '0' && ch <= '9') return ch - '0';
-            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-            return -1;
-        };
-        bool valid = encoded.size() >= 24 && encoded.size() <= 256 && encoded.size() % 2 == 0;
-        if (valid) for (size_t i = 0; i < encoded.size(); i += 2) {
-            int a = nibble(encoded[i]), b = nibble(encoded[i + 1]);
-            if (a < 0 || b < 0) { valid = false; break; }
-            password.push_back((char)(a * 16 + b));
-        }
-        OPENSSL_cleanse(encoded.data(), encoded.size());
-        if (!valid || !ValidAccountPassword(password)) {
-            OPENSSL_cleanse(password.data(), password.size());
-            sendPacket(c.socket, "AUTH_ERROR", "Password must be 12-128 printable characters.");
-            return;
-        }
-        c.auth = accounts.submit(operation == "AUTH_REGISTER", name, std::move(password));
-    }
-}
-
-int main(int argc, char** argv) {
-    if (argc != 4) {
-        cerr << "Usage: ./jengchat_server server.crt server.key accounts.sqlite3\n";
+int main() {
+    if (!initializeSocketLibrary()) {
+        cout << "Socket initialization failed.\n";
         return 1;
     }
-#ifndef _WIN32
-    umask(0077);
-#endif
-    if (!initializeSocketLibrary()) return 1;
-    unique_ptr<Accounts> accounts;
-    try { accounts.reset(new Accounts(argv[3])); }
-    catch (const exception& error) { cerr << error.what() << "\n"; return 1; }
-    SSL_CTX* context = SSL_CTX_new(TLS_server_method());
-    if (!context) return 1;
-    SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
-    SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
-    if (SSL_CTX_use_certificate_chain_file(context, argv[1]) != 1 ||
-        SSL_CTX_use_PrivateKey_file(context, argv[2], SSL_FILETYPE_PEM) != 1 ||
-        SSL_CTX_check_private_key(context) != 1) {
-        cerr << "Cannot load server certificate/private key.\n";
-        SSL_CTX_free(context); return 1;
+
+    Socket serverSocket = socket(
+        AF_INET,
+        SOCK_STREAM,
+        0
+    );
+
+    if (serverSocket == INVALID_SOCK) {
+        cout << "Could not create server socket.\n";
+        cleanupSocketLibrary();
+        return 1;
     }
-    Socket listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener == INVALID_SOCK) { SSL_CTX_free(context); return 1; }
-    int reuse = 1;
-    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(PORT);
     address.sin_addr.s_addr = INADDR_ANY;
-    if (!makeNonblocking(listener) || bind(listener, (sockaddr*)&address, sizeof(address)) == SOCKET_ERR ||
-        listen(listener, SOMAXCONN) == SOCKET_ERR) {
-        cerr << "Cannot listen on port " << PORT << ". Stop the old server first.\n";
-        CLOSE_SOCKET(listener); SSL_CTX_free(context); return 1;
+
+    if (
+        bind(
+            serverSocket,
+            (sockaddr*)&address,
+            sizeof(address)
+        ) == SOCKET_ERR
+    ) {
+        cout << "Bind failed.\n";
+        CLOSE_SOCKET(serverSocket);
+        cleanupSocketLibrary();
+        return 1;
     }
-    cout << "JENG CHAT: TLS + accounts on TCP " << PORT << "\n";
-    auto lastCleanup = chrono::steady_clock::now();
+
+    if (
+        listen(
+            serverSocket,
+            SOMAXCONN
+        ) == SOCKET_ERR
+    ) {
+        cout << "Listen failed.\n";
+        CLOSE_SOCKET(serverSocket);
+        cleanupSocketLibrary();
+        return 1;
+    }
+
+    cout << "================================\n";
+    cout << "        JENG CHAT SERVER\n";
+    cout << "================================\n";
+    cout << "Port: " << PORT << "\n";
+    cout << "Games: Tic-Tac-Toe + Blackjack + Chess + Poker + Roulette + JENG Arena\n";
+    cout << "Waiting for players...\n\n";
+
     while (true) {
-        auto now = chrono::steady_clock::now();
-        if (now - lastCleanup > chrono::minutes(1)) {
-            for (auto it = authLimits.begin(); it != authLimits.end();)
-                if (now - it->second.start > chrono::minutes(2)) it = authLimits.erase(it); else ++it;
-            lastCleanup = now;
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(serverSocket, &readSet);
+
+        Socket maxSocket = serverSocket;
+
+        for (Client& c : clients) {
+            FD_SET(
+                c.socket,
+                &readSet
+            );
+
+            if (c.socket > maxSocket)
+                maxSocket = c.socket;
         }
-        // All socket/TLS calls are nonblocking. Password work runs on a bounded worker queue.
-        sockaddr_in peer{};
-        socklen_t peerSize = sizeof(peer);
-        Socket incoming = accept(listener, (sockaddr*)&peer, &peerSize);
-        if (incoming != INVALID_SOCK) {
-            string ip = inet_ntoa(peer.sin_addr);
-            int sameIP = 0;
-            for (const auto& c : clients) if (c.peerIP == ip) ++sameIP;
-            if (clients.size() >= 128 || sameIP >= 12 || !makeNonblocking(incoming)) CLOSE_SOCKET(incoming);
-            else {
-                int noDelay = 1;
-                setsockopt(incoming, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
-                Client c; c.socket = incoming; c.peerIP = ip;
-                c.tls = SSL_new(context);
-                if (!c.tls || SSL_set_fd(c.tls, (int)incoming) != 1) {
-                    if (c.tls) SSL_free(c.tls);
-                    CLOSE_SOCKET(incoming);
-                } else {
-                    SSL_set_accept_state(c.tls);
-                    clients.push_back(std::move(c));
-                }
-            }
+
+#ifdef _WIN32
+        int nfds = 0; // Ignored by Winsock.
+#else
+        int nfds = maxSocket + 1;
+#endif
+
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 16000; // ~16 ms timer tick for realtime Arena sync
+
+        if (
+            select(
+                nfds,
+                &readSet,
+                nullptr,
+                nullptr,
+                &timeout
+            ) == SOCKET_ERR
+        ) {
+            break;
         }
+
+        // Handle delayed Blackjack deals even when no socket traffic
+        // arrives during this loop iteration.
         processBlackjackDealTimers();
         processArenaRealtimeTick();
-        for (int i = 0; i < (int)clients.size();) {
-            Client& c = clients[i];
-            bool expired = !c.tlsReady ? now - c.connectedAt > chrono::seconds(10)
-                : c.name.empty() && now - c.connectedAt > chrono::seconds(60);
-            if (c.closeRequested || expired) { disconnectClient(i); continue; }
-            if (!c.tlsReady) {
-                ERR_clear_error();
-                int result = SSL_accept(c.tls);
-                if (result == 1) c.tlsReady = true;
-                else if (!tlsRetry(c.tls, result)) c.closeRequested = true;
-                ++i; continue;
+
+        // New connection.
+        if (FD_ISSET(serverSocket, &readSet)) {
+            Socket newClient = accept(
+                serverSocket,
+                nullptr,
+                nullptr
+            );
+
+            if (newClient != INVALID_SOCK) {
+                Client c;
+                c.socket = newClient;
+
+                clients.push_back(c);
+
+                cout << "New connection received.\n";
             }
-            if (c.auth.valid() && c.auth.wait_for(chrono::seconds(0)) == future_status::ready) {
-                auto result = c.auth.get(); c.auth = {};
-                if (result.ok && getClientByName(result.username)) {
-                    result.ok = false; result.message = "This account is already signed in.";
-                }
-                if (result.ok) {
-                    c.name = result.username;
-                    sendPacket(c.socket, "AUTH_OK", c.name);
-                    sendPacket(c.socket, "SYS", "Welcome to JENG CHAT, " + c.name + "!");
-                    broadcastSystem(c.name + " joined the chat.");
-                } else sendPacket(c.socket, "AUTH_ERROR", result.message);
-            }
-            // A pending SSL_write retries the identical bytes before another TLS operation.
-            bool writePending = false;
-            for (int budget = 0; budget < 32 && !c.output.empty(); ++budget) {
-                const auto& message = c.output.front();
-                ERR_clear_error();
-                int sent = SSL_write(c.tls, message.data(), (int)message.size());
-                if (sent <= 0) {
-                    if (!tlsRetry(c.tls, sent)) c.closeRequested = true;
-                    writePending = true; break;
-                }
-                c.outputBytes -= message.size(); c.output.pop_front();
-            }
-            if (!writePending && !c.closeRequested) {
-                char buffer[4096];
-                for (int budget = 0; budget < 8; ++budget) {
-                    ERR_clear_error();
-                    int received = SSL_read(c.tls, buffer, sizeof(buffer));
-                    if (received <= 0) {
-                        if (!tlsRetry(c.tls, received)) c.closeRequested = true;
-                        break;
-                    }
-                    c.inputBuffer.append(buffer, received);
-                    OPENSSL_cleanse(buffer, sizeof(buffer));
-                    if (c.inputBuffer.size() > 16384) { c.closeRequested = true; break; }
-                }
-            }
-            int lines = 0;
-            while (!c.closeRequested && lines++ < 32) {
-                size_t end = c.inputBuffer.find('\n');
-                if (end == string::npos) break;
-                if (end > 4096) { c.closeRequested = true; break; }
-                string line = c.inputBuffer.substr(0, end);
-                OPENSSL_cleanse(c.inputBuffer.data(), end);
-                c.inputBuffer.erase(0, end + 1);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (c.name.empty()) authenticate(c, line, *accounts);
-                else { handleCommand(c, line); sendReady(c.socket); }
-                OPENSSL_cleanse(line.data(), line.size());
-            }
-            if (c.closeRequested) { disconnectClient(i); continue; }
-            ++i;
         }
-        this_thread::sleep_for(chrono::milliseconds(4));
+
+        // Existing clients.
+        for (int i = 0; i < (int)clients.size();) {
+            if (!FD_ISSET(clients[i].socket, &readSet)) {
+                i++;
+                continue;
+            }
+
+            char buffer[BUFFER_SIZE];
+
+            int received = recv(
+                clients[i].socket,
+                buffer,
+                BUFFER_SIZE,
+                0
+            );
+
+            if (received <= 0) {
+                disconnectClient(i);
+                continue;
+            }
+
+            clients[i].inputBuffer.append(
+                buffer,
+                received
+            );
+
+            while (true) {
+                size_t newline =
+                    clients[i]
+                    .inputBuffer
+                    .find('\n');
+
+                if (newline == string::npos)
+                    break;
+
+                string line =
+                    clients[i]
+                    .inputBuffer
+                    .substr(
+                        0,
+                        newline
+                    );
+
+                clients[i]
+                .inputBuffer
+                .erase(
+                    0,
+                    newline + 1
+                );
+
+                if (
+                    !line.empty() &&
+                    line.back() == '\r'
+                ) {
+                    line.pop_back();
+                }
+
+                // First line from a connection is the username.
+                if (clients[i].name.empty()) {
+                    clients[i].name = line;
+
+                    cout
+                        << line
+                        << " connected.\n";
+
+                    sendPacket(
+                        clients[i].socket,
+                        "SYS",
+                        "*** Welcome to JENG CHAT, " +
+                        line +
+                        "! ***"
+                    );
+
+                    sendPacket(
+                        clients[i].socket,
+                        "SYS",
+                        "Type /help for commands."
+                    );
+
+                    broadcastSystem(
+                        "*** " +
+                        line +
+                        " joined the chat ***"
+                    );
+
+                    continue;
+                }
+
+                handleCommand(
+                    clients[i],
+                    line
+                );
+
+                // The sender can type again after the response.
+                // Some game helpers also READY both players;
+                // duplicate READY packets are harmless because
+                // the client suppresses duplicate prompts.
+                sendReady(
+                    clients[i].socket
+                );
+            }
+
+            i++;
+        }
     }
+
+    for (Client& c : clients) {
+        CLOSE_SOCKET(c.socket);
+    }
+
+    CLOSE_SOCKET(serverSocket);
+    cleanupSocketLibrary();
+
+    return 0;
 }

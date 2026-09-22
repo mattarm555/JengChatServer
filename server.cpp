@@ -6226,6 +6226,26 @@ void handleCommand(Client& client, const string& line) {
     }
 
 
+    // Return a structured online-player roster for the Players and Invite menus.
+    // This must be handled before normal chat so USERS_REQUEST is not broadcast.
+    if (workingLine == "USERS_REQUEST") {
+        string roster;
+
+        for (const Client& user : clients) {
+            if (user.name.empty())
+                continue;
+
+            if (!roster.empty())
+                roster += "|";
+
+            roster += user.name;
+        }
+
+        sendPacket(client.socket, "USERS_LIST", roster);
+        return;
+    }
+
+
     // --------------------------------------------------------
     // NORMAL CHAT
     // --------------------------------------------------------

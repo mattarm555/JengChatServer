@@ -56,6 +56,9 @@ using Socket = int;
 
 using namespace std;
 
+/*
+* test
+*/
 const int PORT = 54000;
 const int BUFFER_SIZE = 2048;
 const int MAX_BLACKJACK_HANDS = 50;

@@ -2617,6 +2617,29 @@ string encodeRouletteBets(
     return result;
 }
 
+string encodeRouletteTableBets(
+    const RouletteGame& game
+) {
+    string result;
+
+    for (const RoulettePlayer& player : game.players) {
+        string playerName = getName(player.socket);
+
+        for (const RouletteBet& bet : player.bets) {
+            if (!result.empty())
+                result += ";";
+
+            result +=
+                playerName + "~" +
+                bet.type + "~" +
+                to_string(bet.value) + "~" +
+                to_string(bet.amount);
+        }
+    }
+
+    return result.empty() ? "-" : result;
+}
+
 void sendRouletteState(
     RouletteGame& game
 ) {
@@ -2646,6 +2669,12 @@ void sendRouletteState(
             player.socket,
             "RLT_BETS",
             encodeRouletteBets(player)
+        );
+
+        sendPacket(
+            player.socket,
+            "RLT_TABLE_BETS",
+            encodeRouletteTableBets(game)
         );
     }
 }

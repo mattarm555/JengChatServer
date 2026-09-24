@@ -867,10 +867,31 @@ void sendChessEnd(
     ChessGame& game,
     const string& text
 ) {
-    sendPacket(game.white, "CHESS_END", text);
-    sendPacket(game.black, "CHESS_END", text);
+    auto sendTo = [&](Socket socket) {
+        string yourColor =
+            socket == game.white
+            ? "WHITE"
+            : (socket == game.black ? "BLACK" : "SPECTATOR");
+
+        // Repeat the final board in the end packet. This makes the final
+        // position independent of packet timing and keeps every client,
+        // including spectators, on the same completed position.
+        sendPacket(
+            socket,
+            "CHESS_END",
+            text + "|" +
+            encodeChessBoard(game) + "|" +
+            getName(game.white) + "|" +
+            getName(game.black) + "|" +
+            getName(game.turn) + "|" +
+            yourColor
+        );
+    };
+
+    sendTo(game.white);
+    sendTo(game.black);
     for (Socket spectator : game.spectators)
-        sendPacket(spectator, "CHESS_END", text);
+        sendTo(spectator);
 }
 
 void readyChessPlayers(ChessGame& game) {
@@ -5219,8 +5240,29 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        int startingChips = stoi(fields[0]);
-        int rounds = stoi(fields[1]);
+        int startingChips = 0;
+        int rounds = 0;
+
+        try {
+            size_t chipsLength = 0;
+            size_t roundsLength = 0;
+            startingChips = stoi(fields[0], &chipsLength);
+            rounds = stoi(fields[1], &roundsLength);
+
+            if (
+                chipsLength != fields[0].size() ||
+                roundsLength != fields[1].size()
+            ) {
+                throw invalid_argument("trailing characters");
+            }
+        }
+        catch (...) {
+            sendRouletteError(
+                client.socket,
+                "Starting chips and rounds must be whole numbers."
+            );
+            return;
+        }
 
         if (
             startingChips <= 0 ||

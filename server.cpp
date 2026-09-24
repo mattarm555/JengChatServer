@@ -244,6 +244,7 @@ struct PokerGame {
     struct Standing {
         string name;
         int chips = 0;
+        bool left = false;
     };
 
     vector<Player> players;
@@ -3123,7 +3124,8 @@ void purgeDepartedPokerPlayers(PokerGame& game) {
 }
 
 string pokerLeaderboardData(const PokerGame& game) {
-    vector<PokerGame::Standing> standings = game.departedStandings;
+    vector<PokerGame::Standing> ranked;
+    vector<PokerGame::Standing> leavers;
 
     for (const PokerGame::Player& player : game.players) {
         if (player.left)
@@ -3132,18 +3134,62 @@ string pokerLeaderboardData(const PokerGame& game) {
         PokerGame::Standing standing;
         standing.name = player.name;
         standing.chips = player.chips;
-        standings.push_back(standing);
+        standing.left = false;
+        ranked.push_back(standing);
     }
 
     sort(
-        standings.begin(),
-        standings.end(),
+        ranked.begin(),
+        ranked.end(),
         [](const PokerGame::Standing& left, const PokerGame::Standing& right) {
             if (left.chips != right.chips)
                 return left.chips > right.chips;
             return left.name < right.name;
         }
     );
+
+    // A player who returned to the table is represented by the current seat,
+    // not by an older departure record. Repeated departures also collapse to
+    // one entry, with the most recent chip count retained.
+    for (const PokerGame::Standing& departed : game.departedStandings) {
+        bool currentlySeated = any_of(
+            ranked.begin(),
+            ranked.end(),
+            [&](const PokerGame::Standing& standing) {
+                return lowerCopy(standing.name) == lowerCopy(departed.name);
+            }
+        );
+        if (currentlySeated)
+            continue;
+
+        auto existing = find_if(
+            leavers.begin(),
+            leavers.end(),
+            [&](const PokerGame::Standing& standing) {
+                return lowerCopy(standing.name) == lowerCopy(departed.name);
+            }
+        );
+
+        if (existing == leavers.end()) {
+            PokerGame::Standing standing = departed;
+            standing.left = true;
+            leavers.push_back(standing);
+        }
+        else {
+            existing->chips = departed.chips;
+        }
+    }
+
+    sort(
+        leavers.begin(),
+        leavers.end(),
+        [](const PokerGame::Standing& left, const PokerGame::Standing& right) {
+            return left.name < right.name;
+        }
+    );
+
+    vector<PokerGame::Standing> standings = ranked;
+    standings.insert(standings.end(), leavers.begin(), leavers.end());
 
     string data =
         to_string(game.startingChips) + "|" +
@@ -3152,7 +3198,8 @@ string pokerLeaderboardData(const PokerGame& game) {
     for (const PokerGame::Standing& standing : standings) {
         data +=
             "|" + standing.name +
-            "|" + to_string(standing.chips);
+            "|" + to_string(standing.chips) +
+            "|" + (standing.left ? "1" : "0");
     }
 
     return data;
@@ -8776,6 +8823,32 @@ void handleCommand(Client& client, const string& line) {
         startPokerHand(game);
     }
 
+    else if (command == "/pokerend") {
+        int gameIndex = findPokerGame(client.socket);
+
+        if (gameIndex == -1) {
+            sendPacket(client.socket, "ERR", "You are not in a Poker game.");
+            return;
+        }
+
+        PokerGame& game = pokerGames[gameIndex];
+
+        if (game.host != client.socket) {
+            sendPacket(client.socket, "ERR", "Only the host can end the Poker match.");
+            return;
+        }
+
+        if (game.handActive || game.phase != "RESULT") {
+            sendPacket(client.socket, "ERR", "The Poker match can only be ended between hands.");
+            return;
+        }
+
+        endPokerMatch(
+            gameIndex,
+            client.name + " ended the Poker match."
+        );
+    }
+
 
     // --------------------------------------------------------
     // /resign
@@ -9034,6 +9107,7 @@ void handleCommand(Client& client, const string& line) {
         sendPacket(client.socket, "SYS", "/pokerraise <total_bet>");
         sendPacket(client.socket, "SYS", "/pokerfold");
         sendPacket(client.socket, "SYS", "/pokernext");
+        sendPacket(client.socket, "SYS", "/pokerend");
         sendPacket(client.socket, "SYS", "/resign");
         sendPacket(client.socket, "SYS", "");
         sendPacket(client.socket, "SYS", "CHALLENGES");

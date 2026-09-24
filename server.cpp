@@ -200,6 +200,7 @@ struct ChessGame {
     Socket white;
     Socket black;
     Socket turn;
+    vector<Socket> spectators;
 
     // Uppercase pieces are White, lowercase pieces are Black.
     // Rows: 0 = rank 8, 7 = rank 1.
@@ -529,9 +530,31 @@ int findChessGame(Socket socket) {
         ) {
             return i;
         }
+
+        for (Socket spectator : chessGames[i].spectators)
+            if (spectator == socket)
+                return i;
     }
 
     return -1;
+}
+
+bool chessIsPlayer(
+    const ChessGame& game,
+    Socket socket
+) {
+    return game.white == socket || game.black == socket;
+}
+
+bool chessIsSpectator(
+    const ChessGame& game,
+    Socket socket
+) {
+    return find(
+        game.spectators.begin(),
+        game.spectators.end(),
+        socket
+    ) != game.spectators.end();
 }
 
 int findRouletteGame(Socket socket) {
@@ -792,6 +815,8 @@ void sendChessLine(
     // so the graphical client does not print Chess into chat.
     sendPacket(game.white, "CHESS_NOTICE", text);
     sendPacket(game.black, "CHESS_NOTICE", text);
+    for (Socket spectator : game.spectators)
+        sendPacket(spectator, "CHESS_NOTICE", text);
 }
 
 string encodeChessBoard(const ChessGame& game) {
@@ -815,14 +840,18 @@ void sendChessStateTo(
     string yourColor =
         socket == game.white
         ? "WHITE"
-        : "BLACK";
+        : (socket == game.black ? "BLACK" : "SPECTATOR");
 
     string data =
         encodeChessBoard(game) + "|" +
         getName(game.white) + "|" +
         getName(game.black) + "|" +
         getName(game.turn) + "|" +
-        yourColor;
+        yourColor + "|" +
+        to_string(game.spectators.size());
+
+    for (Socket spectator : game.spectators)
+        data += "|" + getName(spectator);
 
     sendPacket(socket, "CHESS_STATE", data);
 }
@@ -830,6 +859,8 @@ void sendChessStateTo(
 void sendChessState(ChessGame& game) {
     sendChessStateTo(game, game.white);
     sendChessStateTo(game, game.black);
+    for (Socket spectator : game.spectators)
+        sendChessStateTo(game, spectator);
 }
 
 void sendChessEnd(
@@ -838,11 +869,15 @@ void sendChessEnd(
 ) {
     sendPacket(game.white, "CHESS_END", text);
     sendPacket(game.black, "CHESS_END", text);
+    for (Socket spectator : game.spectators)
+        sendPacket(spectator, "CHESS_END", text);
 }
 
 void readyChessPlayers(ChessGame& game) {
     sendReady(game.white);
     sendReady(game.black);
+    for (Socket spectator : game.spectators)
+        sendReady(spectator);
 }
 
 ChessGame makeChessGame(
@@ -1657,9 +1692,6 @@ void playChessMove(
     bool nextHasMove = chessHasLegalMove(game, nextWhite);
 
     if (!nextHasMove) {
-        Socket whiteSocket = game.white;
-        Socket blackSocket = game.black;
-
         showChessBoard(game, false);
 
         if (nextInCheck) {
@@ -1677,8 +1709,7 @@ void playChessMove(
             );
         }
 
-        sendReady(whiteSocket);
-        sendReady(blackSocket);
+        readyChessPlayers(game);
 
         chessGames.erase(
             chessGames.begin() + gameIndex
@@ -5719,6 +5750,119 @@ void handleCommand(Client& client, const string& line) {
     }
 
     // --------------------------------------------------------
+    // Invite another online user to watch an active Chess game.
+    // Either player may invite; spectators may not invite others.
+    // --------------------------------------------------------
+    if (line.rfind("CHESS_SPECTATE_INVITE|", 0) == 0) {
+        string targetName = line.substr(22);
+        int chessIndex = findChessGame(client.socket);
+
+        if (chessIndex == -1 ||
+            !chessIsPlayer(chessGames[chessIndex], client.socket)) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                "Only an active Chess player can invite spectators."
+            );
+            return;
+        }
+
+        ChessGame& game = chessGames[chessIndex];
+
+        if ((int)game.spectators.size() >= 8) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                "This Chess game already has eight spectators."
+            );
+            return;
+        }
+
+        Client* target = getClientByName(targetName);
+
+        if (!target || target->socket == client.socket) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                target ? "You cannot invite yourself." : "User not found."
+            );
+            return;
+        }
+
+        if (isPlayerBusy(target->socket)) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                target->name + " is already in a game."
+            );
+            return;
+        }
+
+        if (target->pendingChallenge != INVALID_SOCK) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                target->name + " already has a pending invitation."
+            );
+            return;
+        }
+
+        target->pendingChallenge = client.socket;
+        target->pendingGame = "chess_spectate";
+        target->pendingChips = 0;
+        target->pendingHands = 0;
+
+        sendPacket(
+            target->socket,
+            "CHESS_SPECTATE_CHALLENGE",
+            client.name + "|" +
+            getName(game.white) + "|" +
+            getName(game.black)
+        );
+        sendPacket(
+            client.socket,
+            "CHESS_NOTICE",
+            "Spectator invitation sent to " + target->name + "."
+        );
+        sendReady(target->socket);
+        return;
+    }
+
+    if (line == "CHESS_SPECTATE_LEAVE") {
+        int chessIndex = findChessGame(client.socket);
+
+        if (chessIndex == -1 ||
+            !chessIsSpectator(chessGames[chessIndex], client.socket)) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                "You are not spectating a Chess game."
+            );
+            return;
+        }
+
+        ChessGame& game = chessGames[chessIndex];
+        game.spectators.erase(
+            remove(
+                game.spectators.begin(),
+                game.spectators.end(),
+                client.socket
+            ),
+            game.spectators.end()
+        );
+
+        sendPacket(
+            client.socket,
+            "CHESS_END",
+            "You stopped spectating the Chess game."
+        );
+        sendReady(client.socket);
+        sendChessState(game);
+        readyChessPlayers(game);
+        return;
+    }
+
+    // --------------------------------------------------------
     // Graphical Chess legal-move request
     // CHESS_LEGAL|e2
     // --------------------------------------------------------
@@ -5736,6 +5880,15 @@ void handleCommand(Client& client, const string& line) {
                 client.socket,
                 "CHESS_ERROR",
                 "You are not in a Chess game."
+            );
+            return;
+        }
+
+        if (!chessIsPlayer(chessGames[chessIndex], client.socket)) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                "Spectators cannot select or move Chess pieces."
             );
             return;
         }
@@ -5779,6 +5932,15 @@ void handleCommand(Client& client, const string& line) {
                 client.socket,
                 "CHESS_ERROR",
                 "You are not in a Chess game."
+            );
+            return;
+        }
+
+        if (!chessIsPlayer(chessGames[chessIndex], client.socket)) {
+            sendPacket(
+                client.socket,
+                "CHESS_ERROR",
+                "Spectators cannot move Chess pieces."
             );
             return;
         }
@@ -7423,6 +7585,54 @@ void handleCommand(Client& client, const string& line) {
         Socket challengerSocket = challenger->socket;
         Socket accepterSocket = client.socket;
 
+        if (gameType == "chess_spectate") {
+            if (isPlayerBusy(accepterSocket)) {
+                clearPendingChallenge(client);
+                sendPacket(
+                    accepterSocket,
+                    "CHESS_ERROR",
+                    "You are already in a game."
+                );
+                return;
+            }
+
+            int chessIndex = findChessGame(challengerSocket);
+
+            if (chessIndex == -1 ||
+                !chessIsPlayer(chessGames[chessIndex], challengerSocket)) {
+                clearPendingChallenge(client);
+                sendPacket(
+                    accepterSocket,
+                    "CHESS_ERROR",
+                    "That Chess game is no longer available."
+                );
+                return;
+            }
+
+            ChessGame& game = chessGames[chessIndex];
+
+            if ((int)game.spectators.size() >= 8) {
+                clearPendingChallenge(client);
+                sendPacket(
+                    accepterSocket,
+                    "CHESS_ERROR",
+                    "That Chess game already has eight spectators."
+                );
+                return;
+            }
+
+            game.spectators.push_back(accepterSocket);
+            clearPendingChallenge(client);
+
+            sendChessState(game);
+            sendChessLine(
+                game,
+                client.name + " joined as a spectator."
+            );
+            readyChessPlayers(game);
+            return;
+        }
+
         // Blackjack invitations join an existing host lobby. The host is
         // intentionally already considered busy because they own that table.
         if (gameType == "blackjack") {
@@ -7855,7 +8065,10 @@ void handleCommand(Client& client, const string& line) {
 
         if (client.pendingGame == "blackjack")
             gameName = "Blackjack";
-        else if (client.pendingGame == "chess")
+        else if (
+            client.pendingGame == "chess" ||
+            client.pendingGame == "chess_spectate"
+        )
             gameName = "Chess";
         else if (client.pendingGame == "poker")
             gameName = "Poker";
@@ -7867,7 +8080,15 @@ void handleCommand(Client& client, const string& line) {
             gameName = "Tic-Tac-Toe";
 
         if (challenger) {
-            if (client.pendingGame == "blackjack") {
+            if (client.pendingGame == "chess_spectate") {
+                sendPacket(
+                    challenger->socket,
+                    "CHESS_NOTICE",
+                    client.name +
+                    " declined your Chess spectator invitation."
+                );
+            }
+            else if (client.pendingGame == "blackjack") {
                 sendPacket(
                     challenger->socket,
                     "BJ_NOTICE",
@@ -7914,6 +8135,7 @@ void handleCommand(Client& client, const string& line) {
         }
 
         bool wasBlackjack = client.pendingGame == "blackjack";
+        bool wasChessSpectate = client.pendingGame == "chess_spectate";
         bool wasRoulette = client.pendingGame == "roulette";
         bool wasPoker = client.pendingGame == "poker";
         bool wasArena = client.pendingGame == "arena";
@@ -7921,7 +8143,9 @@ void handleCommand(Client& client, const string& line) {
 
         sendPacket(
             client.socket,
-            wasBlackjack
+            wasChessSpectate
+                ? "CHESS_NOTICE"
+                : (wasBlackjack
                 ? "BJ_NOTICE"
                 : (
                     wasRoulette
@@ -7931,8 +8155,10 @@ void handleCommand(Client& client, const string& line) {
                         ? "POKER_NOTICE"
                         : (wasArena ? "ARENA_NOTICE" : "GAME")
                       )
-                  ),
-            wasBlackjack
+                  )),
+            wasChessSpectate
+                ? "Chess spectator invitation declined."
+                : (wasBlackjack
                 ? "Blackjack invitation declined."
                 : (
                     wasRoulette
@@ -7946,7 +8172,7 @@ void handleCommand(Client& client, const string& line) {
                             : "Challenge declined."
                           )
                       )
-                  )
+                  ))
         );
     }
 
@@ -8929,13 +9155,19 @@ void handleCommand(Client& client, const string& line) {
         if (chessIndex != -1) {
             ChessGame& game = chessGames[chessIndex];
 
+            if (!chessIsPlayer(game, client.socket)) {
+                sendPacket(
+                    client.socket,
+                    "CHESS_ERROR",
+                    "Spectators cannot resign from a Chess game."
+                );
+                return;
+            }
+
             Socket opponent =
                 game.white == client.socket
                 ? game.black
                 : game.white;
-
-            Socket white = game.white;
-            Socket black = game.black;
 
             sendChessLine(
                 game,
@@ -8949,8 +9181,7 @@ void handleCommand(Client& client, const string& line) {
                 " wins by resignation."
             );
 
-            sendReady(white);
-            sendReady(black);
+            readyChessPlayers(game);
 
             chessGames.erase(
                 chessGames.begin() + chessIndex
@@ -9235,25 +9466,32 @@ void disconnectClient(int index) {
     int chessIndex = findChessGame(socket);
 
     if (chessIndex != -1) {
-        ChessGame game = chessGames[chessIndex];
+        ChessGame& game = chessGames[chessIndex];
 
-        Socket opponent =
-            game.white == socket
-            ? game.black
-            : game.white;
+        if (chessIsSpectator(game, socket)) {
+            game.spectators.erase(
+                remove(
+                    game.spectators.begin(),
+                    game.spectators.end(),
+                    socket
+                ),
+                game.spectators.end()
+            );
+            sendChessState(game);
+            readyChessPlayers(game);
+        }
+        else {
+            sendChessEnd(
+                game,
+                name +
+                " disconnected. Chess game ended."
+            );
+            readyChessPlayers(game);
 
-        sendPacket(
-            opponent,
-            "CHESS_END",
-            name +
-            " disconnected. Chess game ended."
-        );
-
-        sendReady(opponent);
-
-        chessGames.erase(
-            chessGames.begin() + chessIndex
-        );
+            chessGames.erase(
+                chessGames.begin() + chessIndex
+            );
+        }
     }
 
     int blackjackIndex = findBlackjackGame(socket);

@@ -20,7 +20,14 @@ bool ValidAccountPassword(const std::string& password) {
     return true;
 }
 struct Accounts::Impl {
-    struct Job { bool create; std::string name, password; std::promise<AccountResult> result; };
+    enum class Action { CREATE, LOGIN, CHANGE_USERNAME, CHANGE_PASSWORD, DELETE_ACCOUNT };
+    struct Job {
+        Action action;
+        std::string name;
+        std::string password;
+        std::string replacement;
+        std::promise<AccountResult> result;
+    };
     sqlite3* db = nullptr;
     std::string dummy;
     std::mutex mutex;
@@ -30,10 +37,14 @@ struct Accounts::Impl {
     std::thread worker;
 
     AccountResult process(Job& job) {
-        if (!ValidAccountName(job.name) || !ValidAccountPassword(job.password))
-            return {false, "", "Use a 3-16 character username and an 8-128 character password."};
+        if (!ValidAccountName(job.name) || !ValidAccountPassword(job.password)) {
+            bool signingIn = job.action == Action::CREATE || job.action == Action::LOGIN;
+            return {false, "", signingIn
+                ? "Use a 3-16 character username and an 8-128 character password."
+                : "Current password is invalid."};
+        }
         sqlite3_stmt* stmt = nullptr;
-        if (job.create) {
+        if (job.action == Action::CREATE) {
             char hash[crypto_pwhash_STRBYTES];
             if (crypto_pwhash_str(hash, job.password.data(), job.password.size(),
                 crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0)
@@ -48,6 +59,12 @@ struct Accounts::Impl {
             if (rc != SQLITE_DONE) return {false, "", rc == SQLITE_CONSTRAINT ? "That username is unavailable." : "Unable to save account."};
             return {true, job.name, ""};
         }
+
+        if (job.action == Action::CHANGE_USERNAME && !ValidAccountName(job.replacement))
+            return {false, "", "Username: 3-16 letters, numbers, underscores or hyphens."};
+        if (job.action == Action::CHANGE_PASSWORD && !ValidAccountPassword(job.replacement))
+            return {false, "", "New password must be 8-128 printable characters."};
+
         if (sqlite3_prepare_v2(db, "SELECT username,password_hash FROM users WHERE username=? COLLATE NOCASE", -1, &stmt, nullptr) != SQLITE_OK)
             return {false, "", "Account storage unavailable."};
         sqlite3_bind_text(stmt, 1, job.name.c_str(), -1, SQLITE_TRANSIENT);
@@ -59,8 +76,65 @@ struct Accounts::Impl {
         }
         sqlite3_finalize(stmt);
         bool valid = crypto_pwhash_str_verify(hash.c_str(), job.password.data(), job.password.size()) == 0;
-        if (!valid || canonical.empty()) return {false, "", "Incorrect username or password."};
-        return {true, canonical, ""};
+        if (!valid || canonical.empty())
+            return {false, "", job.action == Action::LOGIN ? "Incorrect username or password." : "Current password is incorrect."};
+
+        if (job.action == Action::LOGIN)
+            return {true, canonical, ""};
+
+        if (job.action == Action::CHANGE_USERNAME) {
+            if (sqlite3_prepare_v2(db, "UPDATE users SET username=? WHERE username=? COLLATE NOCASE", -1, &stmt, nullptr) != SQLITE_OK)
+                return {false, "", "Account storage unavailable."};
+            sqlite3_bind_text(stmt, 1, job.replacement.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, canonical.c_str(), -1, SQLITE_TRANSIENT);
+            int update = sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            if (update != SQLITE_DONE)
+                return {false, "", update == SQLITE_CONSTRAINT ? "That username is unavailable." : "Unable to change username."};
+            return {true, job.replacement, "Username changed."};
+        }
+
+        if (job.action == Action::CHANGE_PASSWORD) {
+            char replacementHash[crypto_pwhash_STRBYTES];
+            if (crypto_pwhash_str(replacementHash, job.replacement.data(), job.replacement.size(),
+                crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0)
+                return {false, "", "Account service busy. Please retry."};
+            if (sqlite3_prepare_v2(db, "UPDATE users SET password_hash=? WHERE username=? COLLATE NOCASE", -1, &stmt, nullptr) != SQLITE_OK) {
+                sodium_memzero(replacementHash, sizeof(replacementHash));
+                return {false, "", "Account storage unavailable."};
+            }
+            sqlite3_bind_text(stmt, 1, replacementHash, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, canonical.c_str(), -1, SQLITE_TRANSIENT);
+            int update = sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            sodium_memzero(replacementHash, sizeof(replacementHash));
+            if (update != SQLITE_DONE) return {false, "", "Unable to change password."};
+            return {true, canonical, "Password changed."};
+        }
+
+        if (sqlite3_prepare_v2(db, "DELETE FROM users WHERE username=? COLLATE NOCASE", -1, &stmt, nullptr) != SQLITE_OK)
+            return {false, "", "Account storage unavailable."};
+        sqlite3_bind_text(stmt, 1, canonical.c_str(), -1, SQLITE_TRANSIENT);
+        int removed = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (removed != SQLITE_DONE) return {false, "", "Unable to delete account."};
+        return {true, canonical, "Account deleted."};
+    }
+
+    std::shared_future<AccountResult> enqueue(Job job) {
+        auto future = job.result.get_future().share();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (jobs.size() >= 8) {
+                sodium_memzero(job.password.data(), job.password.size());
+                sodium_memzero(job.replacement.data(), job.replacement.size());
+                job.result.set_value({false, "", "Account service busy. Please retry."});
+                return future;
+            }
+            jobs.push_back(std::move(job));
+        }
+        wake.notify_one();
+        return future;
     }
 };
 Accounts::Accounts(const std::string& path) : impl(new Impl) {
@@ -96,6 +170,7 @@ Accounts::Accounts(const std::string& path) : impl(new Impl) {
             try { result = impl->process(job); }
             catch (...) { result = {false, "", "Account service unavailable."}; }
             sodium_memzero(job.password.data(), job.password.size());
+            sodium_memzero(job.replacement.data(), job.replacement.size());
             job.result.set_value(std::move(result));
         }
     });
@@ -107,17 +182,22 @@ Accounts::~Accounts() {
     sqlite3_close(impl->db);
 }
 std::shared_future<AccountResult> Accounts::submit(bool create, std::string name, std::string password) {
-    Impl::Job job{create, std::move(name), std::move(password), {}};
-    auto future = job.result.get_future().share();
-    {
-        std::lock_guard<std::mutex> lock(impl->mutex);
-        if (impl->jobs.size() >= 8) {
-            sodium_memzero(job.password.data(), job.password.size());
-            job.result.set_value({false, "", "Account service busy. Please retry."});
-            return future;
-        }
-        impl->jobs.push_back(std::move(job));
-    }
-    impl->wake.notify_one();
-    return future;
+    return impl->enqueue({
+        create ? Impl::Action::CREATE : Impl::Action::LOGIN,
+        std::move(name), std::move(password), "", {}});
+}
+std::shared_future<AccountResult> Accounts::changeUsername(
+    std::string name, std::string currentPassword, std::string newUsername) {
+    return impl->enqueue({Impl::Action::CHANGE_USERNAME, std::move(name),
+        std::move(currentPassword), std::move(newUsername), {}});
+}
+std::shared_future<AccountResult> Accounts::changePassword(
+    std::string name, std::string currentPassword, std::string newPassword) {
+    return impl->enqueue({Impl::Action::CHANGE_PASSWORD, std::move(name),
+        std::move(currentPassword), std::move(newPassword), {}});
+}
+std::shared_future<AccountResult> Accounts::deleteAccount(
+    std::string name, std::string currentPassword) {
+    return impl->enqueue({Impl::Action::DELETE_ACCOUNT, std::move(name),
+        std::move(currentPassword), "", {}});
 }

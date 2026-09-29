@@ -115,11 +115,13 @@ struct Client {
     SSL* tls = nullptr;
     bool tlsReady = false;
     bool closeRequested = false;
+    bool closeAfterFlush = false;
     string peerIP;
     std::deque<string> output;
     size_t outputBytes = 0;
     std::chrono::steady_clock::time_point connectedAt = std::chrono::steady_clock::now();
     std::shared_future<AccountResult> auth;
+    string accountAction;
 
 
     Socket pendingChallenge = INVALID_SOCK;
@@ -8694,6 +8696,27 @@ namespace {
         if (now - limit.start >= chrono::minutes(1)) limit = {0, now};
         return ++limit.count <= maximum;
     }
+    bool decodePassword(string encoded, string& password) {
+        auto nibble = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            return -1;
+        };
+        bool valid = encoded.size() >= 16 && encoded.size() <= 256 && encoded.size() % 2 == 0;
+        if (valid) for (size_t i = 0; i < encoded.size(); i += 2) {
+            int a = nibble(encoded[i]), b = nibble(encoded[i + 1]);
+            if (a < 0 || b < 0) { valid = false; break; }
+            password.push_back((char)(a * 16 + b));
+        }
+        OPENSSL_cleanse(encoded.data(), encoded.size());
+        if (!valid || !ValidAccountPassword(password)) {
+            OPENSSL_cleanse(password.data(), password.size());
+            password.clear();
+            return false;
+        }
+        return true;
+    }
     void authenticate(Client& c, string& line, Accounts& accounts) {
         if (c.auth.valid()) return;
         // Hex encoding avoids protocol delimiters in passwords; TLS supplies confidentiality.
@@ -8713,26 +8736,63 @@ namespace {
             sendPacket(c.socket, "AUTH_ERROR", "Too many attempts. Wait one minute and retry.");
             return;
         }
-        string encoded = line.substr(second + 1), password;
-        auto nibble = [](char ch) -> int {
-            if (ch >= '0' && ch <= '9') return ch - '0';
-            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-            return -1;
-        };
-        bool valid = encoded.size() >= 16 && encoded.size() <= 256 && encoded.size() % 2 == 0;
-        if (valid) for (size_t i = 0; i < encoded.size(); i += 2) {
-            int a = nibble(encoded[i]), b = nibble(encoded[i + 1]);
-            if (a < 0 || b < 0) { valid = false; break; }
-            password.push_back((char)(a * 16 + b));
-        }
-        OPENSSL_cleanse(encoded.data(), encoded.size());
-        if (!valid || !ValidAccountPassword(password)) {
-            OPENSSL_cleanse(password.data(), password.size());
+        string password;
+        if (!decodePassword(line.substr(second + 1), password)) {
             sendPacket(c.socket, "AUTH_ERROR", "Password must be 8-128 printable characters.");
             return;
         }
+        c.accountAction = operation;
         c.auth = accounts.submit(operation == "AUTH_REGISTER", name, std::move(password));
+    }
+
+    void handleAccountCommand(Client& c, const string& line, Accounts& accounts) {
+        if (c.auth.valid()) {
+            sendPacket(c.socket, "ACCOUNT_ERROR", "Another account change is still processing.");
+            return;
+        }
+        if (!allowAuth("ip:" + c.peerIP, 20) || !allowAuth("account:" + lowerCopy(c.name), 10)) {
+            sendPacket(c.socket, "ACCOUNT_ERROR", "Too many account attempts. Wait one minute and retry.");
+            return;
+        }
+
+        vector<string> fields;
+        string field;
+        stringstream stream(line);
+        while (getline(stream, field, '|')) fields.push_back(field);
+        if (fields.empty()) return;
+
+        string currentPassword;
+        if (fields[0] == "ACCOUNT_USERNAME" && fields.size() == 3) {
+            if (!decodePassword(fields[2], currentPassword)) {
+                sendPacket(c.socket, "ACCOUNT_ERROR", "Current password is invalid.");
+                return;
+            }
+            c.accountAction = fields[0];
+            c.auth = accounts.changeUsername(c.name, std::move(currentPassword), fields[1]);
+            return;
+        }
+        if (fields[0] == "ACCOUNT_PASSWORD" && fields.size() == 3) {
+            string newPassword;
+            if (!decodePassword(fields[1], currentPassword) || !decodePassword(fields[2], newPassword)) {
+                OPENSSL_cleanse(currentPassword.data(), currentPassword.size());
+                OPENSSL_cleanse(newPassword.data(), newPassword.size());
+                sendPacket(c.socket, "ACCOUNT_ERROR", "Passwords must be 8-128 printable characters.");
+                return;
+            }
+            c.accountAction = fields[0];
+            c.auth = accounts.changePassword(c.name, std::move(currentPassword), std::move(newPassword));
+            return;
+        }
+        if (fields[0] == "ACCOUNT_DELETE" && fields.size() == 2) {
+            if (!decodePassword(fields[1], currentPassword)) {
+                sendPacket(c.socket, "ACCOUNT_ERROR", "Current password is invalid.");
+                return;
+            }
+            c.accountAction = fields[0];
+            c.auth = accounts.deleteAccount(c.name, std::move(currentPassword));
+            return;
+        }
+        sendPacket(c.socket, "ACCOUNT_ERROR", "Invalid account request.");
     }
 }
 
@@ -8819,15 +8879,40 @@ int main(int argc, char** argv) {
             }
             if (c.auth.valid() && c.auth.wait_for(chrono::seconds(0)) == future_status::ready) {
                 auto result = c.auth.get(); c.auth = {};
-                if (result.ok && getClientByName(result.username)) {
-                    result.ok = false; result.message = "This account is already signed in.";
+                string action = c.accountAction;
+                c.accountAction.clear();
+                if (action == "AUTH_LOGIN" || action == "AUTH_REGISTER") {
+                    if (result.ok && getClientByName(result.username)) {
+                        result.ok = false; result.message = "This account is already signed in.";
+                    }
+                    if (result.ok) {
+                        c.name = result.username;
+                        sendPacket(c.socket, "AUTH_OK", c.name);
+                        sendPacket(c.socket, "SYS", "Welcome to JENG CHAT, " + c.name + "!");
+                        broadcastSystem(c.name + " joined the chat.");
+                    } else sendPacket(c.socket, "AUTH_ERROR", result.message);
                 }
-                if (result.ok) {
-                    c.name = result.username;
-                    sendPacket(c.socket, "AUTH_OK", c.name);
-                    sendPacket(c.socket, "SYS", "Welcome to JENG CHAT, " + c.name + "!");
-                    broadcastSystem(c.name + " joined the chat.");
-                } else sendPacket(c.socket, "AUTH_ERROR", result.message);
+                else if (!result.ok) {
+                    sendPacket(c.socket, "ACCOUNT_ERROR", result.message);
+                }
+                else if (action == "ACCOUNT_USERNAME") {
+                    Client* existing = getClientByName(result.username);
+                    if (existing && existing != &c) {
+                        sendPacket(c.socket, "ACCOUNT_ERROR", "That username is already signed in.");
+                    } else {
+                        string oldName = c.name;
+                        c.name = result.username;
+                        sendPacket(c.socket, "ACCOUNT_USERNAME", c.name);
+                        broadcastSystem(oldName + " is now known as " + c.name + ".");
+                    }
+                }
+                else if (action == "ACCOUNT_PASSWORD") {
+                    sendPacket(c.socket, "ACCOUNT_PASSWORD", result.message);
+                }
+                else if (action == "ACCOUNT_DELETE") {
+                    sendPacket(c.socket, "ACCOUNT_DELETED", result.message);
+                    c.closeAfterFlush = true;
+                }
             }
             // A pending SSL_write retries the identical bytes before another TLS operation.
             bool writePending = false;
@@ -8841,6 +8926,7 @@ int main(int argc, char** argv) {
                 }
                 c.outputBytes -= message.size(); c.output.pop_front();
             }
+            if (c.closeAfterFlush && c.output.empty()) c.closeRequested = true;
             if (!writePending && !c.closeRequested) {
                 char buffer[4096];
                 for (int budget = 0; budget < 8; ++budget) {
@@ -8865,6 +8951,7 @@ int main(int argc, char** argv) {
                 c.inputBuffer.erase(0, end + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 if (c.name.empty()) authenticate(c, line, *accounts);
+                else if (line.rfind("ACCOUNT_", 0) == 0) handleAccountCommand(c, line, *accounts);
                 else { handleCommand(c, line); sendReady(c.socket); }
                 OPENSSL_cleanse(line.data(), line.size());
             }

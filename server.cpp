@@ -8729,7 +8729,7 @@ namespace {
         OPENSSL_cleanse(encoded.data(), encoded.size());
         if (!valid || !ValidAccountPassword(password)) {
             OPENSSL_cleanse(password.data(), password.size());
-            sendPacket(c.socket, "AUTH_ERROR", "Password must be 12-128 printable characters.");
+            sendPacket(c.socket, "AUTH_ERROR", "Password must be 8-128 printable characters.");
             return;
         }
         c.auth = accounts.submit(operation == "AUTH_REGISTER", name, std::move(password));

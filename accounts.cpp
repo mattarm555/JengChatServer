@@ -15,7 +15,7 @@ bool ValidAccountName(const std::string& name) {
     return true;
 }
 bool ValidAccountPassword(const std::string& password) {
-    if (password.size() < 12 || password.size() > 128) return false;
+    if (password.size() < 8 || password.size() > 128) return false;
     for (unsigned char c : password) if (c < 32 || c > 126) return false;
     return true;
 }
@@ -31,7 +31,7 @@ struct Accounts::Impl {
 
     AccountResult process(Job& job) {
         if (!ValidAccountName(job.name) || !ValidAccountPassword(job.password))
-            return {false, "", "Use a 3-16 character username and a 12-128 character password."};
+            return {false, "", "Use a 3-16 character username and an 8-128 character password."};
         sqlite3_stmt* stmt = nullptr;
         if (job.create) {
             char hash[crypto_pwhash_STRBYTES];

@@ -8720,7 +8720,7 @@ namespace {
             if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
             return -1;
         };
-        bool valid = encoded.size() >= 24 && encoded.size() <= 256 && encoded.size() % 2 == 0;
+        bool valid = encoded.size() >= 16 && encoded.size() <= 256 && encoded.size() % 2 == 0;
         if (valid) for (size_t i = 0; i < encoded.size(); i += 2) {
             int a = nibble(encoded[i]), b = nibble(encoded[i + 1]);
             if (a < 0 || b < 0) { valid = false; break; }

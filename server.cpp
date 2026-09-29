@@ -1,3 +1,17 @@
+#include "accounts.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/crypto.h>
+#include <deque>
+#include <map>
+#include <future>
+#include <memory>
+#include <thread>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <netinet/tcp.h>
+#include <sys/stat.h>
+#endif
 #include <iostream>
 #include <vector>
 #include <string>
@@ -98,24 +112,20 @@ struct Client {
     Socket socket;
     string name;
     string inputBuffer;
+    SSL* tls = nullptr;
+    bool tlsReady = false;
+    bool closeRequested = false;
+    string peerIP;
+    std::deque<string> output;
+    size_t outputBytes = 0;
+    std::chrono::steady_clock::time_point connectedAt = std::chrono::steady_clock::now();
+    std::shared_future<AccountResult> auth;
+
 
     Socket pendingChallenge = INVALID_SOCK;
     string pendingGame;
     int pendingChips = 0;
     int pendingHands = 0;
-};
-
-struct TicTacToeGame {
-    Socket playerX;
-    Socket playerO;
-
-    char board[9] = {
-        ' ', ' ', ' ',
-        ' ', ' ', ' ',
-        ' ', ' ', ' '
-    };
-
-    Socket turn;
 };
 
 struct Card {
@@ -200,7 +210,6 @@ struct ChessGame {
     Socket white;
     Socket black;
     Socket turn;
-    vector<Socket> spectators;
 
     // Uppercase pieces are White, lowercase pieces are Black.
     // Rows: 0 = rank 8, 7 = rank 1.
@@ -229,46 +238,35 @@ enum class PokerStage {
 
 struct PokerGame {
     Socket host = INVALID_SOCK;
-
-    struct Player {
-        Socket socket = INVALID_SOCK;
-        string name;
-        int chips = 0;
-        int roundBet = 0;
-        int handContribution = 0;
-        bool acted = false;
-        bool folded = false;
-        bool left = false;
-        vector<Card> hole;
-    };
-
-    struct Standing {
-        string name;
-        int chips = 0;
-        bool left = false;
-    };
-
-    vector<Player> players;
-    vector<Standing> departedStandings;
+    Socket player1 = INVALID_SOCK;
+    Socket player2 = INVALID_SOCK;
 
     int startingChips = 0;
     string phase = "LOBBY";
-    string status = "Table created. Invite up to five players.";
+    string status = "Table created. Invite a player.";
+
+    int player1Chips = 0;
+    int player2Chips = 0;
 
     int smallBlind = 0;
     int bigBlind = 0;
 
     Socket dealer = INVALID_SOCK;
-    Socket smallBlindPlayer = INVALID_SOCK;
-    Socket bigBlindPlayer = INVALID_SOCK;
     Socket turn = INVALID_SOCK;
 
     vector<Card> deck;
+    vector<Card> player1Hole;
+    vector<Card> player2Hole;
     vector<Card> community;
 
     int pot = 0;
+    int player1RoundBet = 0;
+    int player2RoundBet = 0;
     int currentBet = 0;
     int lastRaiseSize = 0;
+
+    bool player1Acted = false;
+    bool player2Acted = false;
 
     bool handActive = false;
     int handNumber = 0;
@@ -354,7 +352,6 @@ struct ArenaGame {
 };
 
 vector<Client> clients;
-vector<TicTacToeGame> ticTacToeGames;
 vector<BlackjackGame> blackjackGames;
 vector<ChessGame> chessGames;
 vector<PokerGame> pokerGames;
@@ -369,23 +366,18 @@ static mt19937 rng(random_device{}());
 // ============================================================
 
 bool sendAll(Socket socket, const string& data) {
-    int total = 0;
-
-    while (total < (int)data.size()) {
-        int sent = send(
-            socket,
-            data.c_str() + total,
-            (int)data.size() - total,
-            0
-        );
-
-        if (sent == SOCKET_ERR || sent == 0)
+    for (Client& c : clients) {
+        if (c.socket != socket) continue;
+        if (!c.tlsReady || c.closeRequested) return false;
+        if (c.outputBytes + data.size() > 2 * 1024 * 1024) {
+            c.closeRequested = true;
             return false;
-
-        total += sent;
+        }
+        c.output.push_back(data);
+        c.outputBytes += data.size();
+        return true;
     }
-
-    return true;
+    return false;
 }
 
 void sendPacket(
@@ -498,19 +490,6 @@ void broadcastChat(
 // GAME LOOKUPS
 // ============================================================
 
-int findTicTacToeGame(Socket socket) {
-    for (int i = 0; i < (int)ticTacToeGames.size(); i++) {
-        if (
-            ticTacToeGames[i].playerX == socket ||
-            ticTacToeGames[i].playerO == socket
-        ) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
 int findBlackjackGame(Socket socket) {
     for (int i = 0; i < (int)blackjackGames.size(); i++) {
         for (const BlackjackPlayer& player : blackjackGames[i].players) {
@@ -530,31 +509,9 @@ int findChessGame(Socket socket) {
         ) {
             return i;
         }
-
-        for (Socket spectator : chessGames[i].spectators)
-            if (spectator == socket)
-                return i;
     }
 
     return -1;
-}
-
-bool chessIsPlayer(
-    const ChessGame& game,
-    Socket socket
-) {
-    return game.white == socket || game.black == socket;
-}
-
-bool chessIsSpectator(
-    const ChessGame& game,
-    Socket socket
-) {
-    return find(
-        game.spectators.begin(),
-        game.spectators.end(),
-        socket
-    ) != game.spectators.end();
 }
 
 int findRouletteGame(Socket socket) {
@@ -570,9 +527,12 @@ int findRouletteGame(Socket socket) {
 
 int findPokerGame(Socket socket) {
     for (int i = 0; i < (int)pokerGames.size(); i++) {
-        for (const PokerGame::Player& player : pokerGames[i].players)
-            if (!player.left && player.socket == socket)
-                return i;
+        if (
+            pokerGames[i].player1 == socket ||
+            pokerGames[i].player2 == socket
+        ) {
+            return i;
+        }
     }
 
     return -1;
@@ -591,146 +551,11 @@ int findArenaGame(Socket socket) {
 
 bool isPlayerBusy(Socket socket) {
     return
-        findTicTacToeGame(socket) != -1 ||
         findBlackjackGame(socket) != -1 ||
         findChessGame(socket) != -1 ||
         findPokerGame(socket) != -1 ||
         findRouletteGame(socket) != -1 ||
         findArenaGame(socket) != -1;
-}
-
-
-// ============================================================
-// TIC-TAC-TOE
-// ============================================================
-
-void sendTicTacToeLine(
-    TicTacToeGame& game,
-    const string& text
-) {
-    sendPacket(
-        game.playerX,
-        "GAME",
-        text
-    );
-
-    sendPacket(
-        game.playerO,
-        "GAME",
-        text
-    );
-}
-
-char displayCell(TicTacToeGame& game, int index) {
-    if (game.board[index] != ' ')
-        return game.board[index];
-
-    return '1' + index;
-}
-
-void showTicTacToeBoard(
-    TicTacToeGame& game,
-    bool showTurn = true
-) {
-    sendTicTacToeLine(game, "");
-    sendTicTacToeLine(game, "========== TIC-TAC-TOE ==========");
-
-    sendTicTacToeLine(
-        game,
-        getName(game.playerX) +
-        " (X) vs " +
-        getName(game.playerO) +
-        " (O)"
-    );
-
-    sendTicTacToeLine(game, "");
-
-    string row1;
-    row1 += " ";
-    row1 += displayCell(game, 0);
-    row1 += " | ";
-    row1 += displayCell(game, 1);
-    row1 += " | ";
-    row1 += displayCell(game, 2);
-
-    string row2;
-    row2 += " ";
-    row2 += displayCell(game, 3);
-    row2 += " | ";
-    row2 += displayCell(game, 4);
-    row2 += " | ";
-    row2 += displayCell(game, 5);
-
-    string row3;
-    row3 += " ";
-    row3 += displayCell(game, 6);
-    row3 += " | ";
-    row3 += displayCell(game, 7);
-    row3 += " | ";
-    row3 += displayCell(game, 8);
-
-    sendTicTacToeLine(game, row1);
-    sendTicTacToeLine(game, "---+---+---");
-    sendTicTacToeLine(game, row2);
-    sendTicTacToeLine(game, "---+---+---");
-    sendTicTacToeLine(game, row3);
-    sendTicTacToeLine(game, "");
-
-    if (showTurn) {
-        string symbol =
-            game.turn == game.playerX
-            ? "X"
-            : "O";
-
-        sendTicTacToeLine(
-            game,
-            "Turn: " +
-            getName(game.turn) +
-            " (" +
-            symbol +
-            ")"
-        );
-    }
-
-    sendTicTacToeLine(game, "================================");
-    sendTicTacToeLine(game, "");
-}
-
-bool ticTacToeWinner(
-    TicTacToeGame& game,
-    char symbol
-) {
-    int combinations[8][3] = {
-        {0,1,2},
-        {3,4,5},
-        {6,7,8},
-        {0,3,6},
-        {1,4,7},
-        {2,5,8},
-        {0,4,8},
-        {2,4,6}
-    };
-
-    for (auto& combo : combinations) {
-        if (
-            game.board[combo[0]] == symbol &&
-            game.board[combo[1]] == symbol &&
-            game.board[combo[2]] == symbol
-        ) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool ticTacToeBoardFull(TicTacToeGame& game) {
-    for (char cell : game.board) {
-        if (cell == ' ')
-            return false;
-    }
-
-    return true;
 }
 
 
@@ -815,8 +640,6 @@ void sendChessLine(
     // so the graphical client does not print Chess into chat.
     sendPacket(game.white, "CHESS_NOTICE", text);
     sendPacket(game.black, "CHESS_NOTICE", text);
-    for (Socket spectator : game.spectators)
-        sendPacket(spectator, "CHESS_NOTICE", text);
 }
 
 string encodeChessBoard(const ChessGame& game) {
@@ -840,18 +663,14 @@ void sendChessStateTo(
     string yourColor =
         socket == game.white
         ? "WHITE"
-        : (socket == game.black ? "BLACK" : "SPECTATOR");
+        : "BLACK";
 
     string data =
         encodeChessBoard(game) + "|" +
         getName(game.white) + "|" +
         getName(game.black) + "|" +
         getName(game.turn) + "|" +
-        yourColor + "|" +
-        to_string(game.spectators.size());
-
-    for (Socket spectator : game.spectators)
-        data += "|" + getName(spectator);
+        yourColor;
 
     sendPacket(socket, "CHESS_STATE", data);
 }
@@ -859,46 +678,19 @@ void sendChessStateTo(
 void sendChessState(ChessGame& game) {
     sendChessStateTo(game, game.white);
     sendChessStateTo(game, game.black);
-    for (Socket spectator : game.spectators)
-        sendChessStateTo(game, spectator);
 }
 
 void sendChessEnd(
     ChessGame& game,
     const string& text
 ) {
-    auto sendTo = [&](Socket socket) {
-        string yourColor =
-            socket == game.white
-            ? "WHITE"
-            : (socket == game.black ? "BLACK" : "SPECTATOR");
-
-        // Repeat the final board in the end packet. This makes the final
-        // position independent of packet timing and keeps every client,
-        // including spectators, on the same completed position.
-        sendPacket(
-            socket,
-            "CHESS_END",
-            text + "|" +
-            encodeChessBoard(game) + "|" +
-            getName(game.white) + "|" +
-            getName(game.black) + "|" +
-            getName(game.turn) + "|" +
-            yourColor
-        );
-    };
-
-    sendTo(game.white);
-    sendTo(game.black);
-    for (Socket spectator : game.spectators)
-        sendTo(spectator);
+    sendPacket(game.white, "CHESS_END", text);
+    sendPacket(game.black, "CHESS_END", text);
 }
 
 void readyChessPlayers(ChessGame& game) {
     sendReady(game.white);
     sendReady(game.black);
-    for (Socket spectator : game.spectators)
-        sendReady(spectator);
 }
 
 ChessGame makeChessGame(
@@ -1713,6 +1505,9 @@ void playChessMove(
     bool nextHasMove = chessHasLegalMove(game, nextWhite);
 
     if (!nextHasMove) {
+        Socket whiteSocket = game.white;
+        Socket blackSocket = game.black;
+
         showChessBoard(game, false);
 
         if (nextInCheck) {
@@ -1730,7 +1525,8 @@ void playChessMove(
             );
         }
 
-        readyChessPlayers(game);
+        sendReady(whiteSocket);
+        sendReady(blackSocket);
 
         chessGames.erase(
             chessGames.begin() + gameIndex
@@ -2669,29 +2465,6 @@ string encodeRouletteBets(
     return result;
 }
 
-string encodeRouletteTableBets(
-    const RouletteGame& game
-) {
-    string result;
-
-    for (const RoulettePlayer& player : game.players) {
-        string playerName = getName(player.socket);
-
-        for (const RouletteBet& bet : player.bets) {
-            if (!result.empty())
-                result += ";";
-
-            result +=
-                playerName + "~" +
-                bet.type + "~" +
-                to_string(bet.value) + "~" +
-                to_string(bet.amount);
-        }
-    }
-
-    return result.empty() ? "-" : result;
-}
-
 void sendRouletteState(
     RouletteGame& game
 ) {
@@ -2721,12 +2494,6 @@ void sendRouletteState(
             player.socket,
             "RLT_BETS",
             encodeRouletteBets(player)
-        );
-
-        sendPacket(
-            player.socket,
-            "RLT_TABLE_BETS",
-            encodeRouletteTableBets(game)
         );
     }
 }
@@ -2903,7 +2670,7 @@ void resolveRouletteSpin(
 
 
 // ============================================================
-// POKER - 2 TO 6 PLAYER TEXAS HOLD'EM
+// POKER - HEADS-UP TEXAS HOLD'EM
 // ============================================================
 
 string pokerStageName(PokerStage stage) {
@@ -2918,95 +2685,42 @@ string pokerStageName(PokerStage stage) {
     return "UNKNOWN";
 }
 
-int pokerPlayerIndex(const PokerGame& game, Socket socket) {
-    for (int i = 0; i < (int)game.players.size(); i++)
-        if (game.players[i].socket == socket)
-            return i;
-
-    return -1;
-}
-
-PokerGame::Player* pokerPlayer(PokerGame& game, Socket socket) {
-    int index = pokerPlayerIndex(game, socket);
-    return index < 0 ? nullptr : &game.players[index];
-}
-
-const PokerGame::Player* pokerPlayer(const PokerGame& game, Socket socket) {
-    int index = pokerPlayerIndex(game, socket);
-    return index < 0 ? nullptr : &game.players[index];
-}
-
-Socket nextPokerPlayer(
+Socket otherPokerPlayer(
     const PokerGame& game,
-    Socket after,
-    bool requireChips,
-    bool requireAction
+    Socket socket
 ) {
-    if (game.players.empty())
-        return INVALID_SOCK;
-
-    int start = pokerPlayerIndex(game, after);
-    if (start < 0)
-        start = (int)game.players.size() - 1;
-
-    for (int offset = 1; offset <= (int)game.players.size(); offset++) {
-        const PokerGame::Player& player =
-            game.players[(start + offset) % game.players.size()];
-
-        if (player.left)
-            continue;
-        if (requireChips && player.chips <= 0)
-            continue;
-        if (requireAction && (player.folded || player.chips <= 0))
-            continue;
-        return player.socket;
-    }
-
-    return INVALID_SOCK;
+    return
+        game.player1 == socket
+        ? game.player2
+        : game.player1;
 }
 
-int activePokerPlayers(const PokerGame& game) {
-    int count = 0;
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left && !player.folded)
-            count++;
-    return count;
+int& pokerChips(PokerGame& game, Socket socket) {
+    return
+        game.player1 == socket
+        ? game.player1Chips
+        : game.player2Chips;
 }
 
-int seatedPokerPlayers(const PokerGame& game) {
-    int count = 0;
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left)
-            count++;
-    return count;
+int& pokerRoundBet(PokerGame& game, Socket socket) {
+    return
+        game.player1 == socket
+        ? game.player1RoundBet
+        : game.player2RoundBet;
 }
 
-int fundedPokerPlayers(const PokerGame& game) {
-    int count = 0;
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left && player.chips > 0)
-            count++;
-    return count;
+bool& pokerActed(PokerGame& game, Socket socket) {
+    return
+        game.player1 == socket
+        ? game.player1Acted
+        : game.player2Acted;
 }
 
-int pokerMaximumRaiseTo(const PokerGame& game, Socket socket) {
-    const PokerGame::Player* actor = pokerPlayer(game, socket);
-    if (!actor)
-        return game.currentBet;
-
-    int actorMaximum = actor->roundBet + actor->chips;
-    int opponentMaximum = 0;
-
-    for (const PokerGame::Player& player : game.players) {
-        if (player.left || player.socket == socket || player.folded)
-            continue;
-        opponentMaximum = max(
-            opponentMaximum,
-            player.roundBet + player.chips
-        );
-    }
-
-    return min(actorMaximum, opponentMaximum);
+vector<Card>& pokerHole(PokerGame& game, Socket socket) {
+    return
+        game.player1 == socket
+        ? game.player1Hole
+        : game.player2Hole;
 }
 
 string pokerCardCode(const Card& card) {
@@ -3047,23 +2761,43 @@ Card drawPokerCard(PokerGame& game) {
 void sendPokerLobbyState(
     PokerGame& game
 ) {
+    string player1Name =
+        game.player1 == INVALID_SOCK
+        ? ""
+        : getName(game.player1);
+
+    string player2Name =
+        game.player2 == INVALID_SOCK
+        ? ""
+        : getName(game.player2);
+
     string data =
         getName(game.host) + "|" +
         to_string(game.startingChips) + "|" +
         to_string(game.smallBlind) + "|" +
         to_string(game.bigBlind) + "|" +
-        game.status + "|" +
-        to_string(seatedPokerPlayers(game));
+        player1Name + "|" +
+        player2Name + "|" +
+        game.status;
 
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left)
-            data += "|" + player.name;
+    if (game.player1 != INVALID_SOCK) {
+        sendPacket(
+            game.player1,
+            "POKER_LOBBY",
+            data
+        );
 
-    for (const PokerGame::Player& player : game.players) {
-        if (player.left)
-            continue;
-        sendPacket(player.socket, "POKER_LOBBY", data);
-        sendReady(player.socket);
+        sendReady(game.player1);
+    }
+
+    if (game.player2 != INVALID_SOCK) {
+        sendPacket(
+            game.player2,
+            "POKER_LOBBY",
+            data
+        );
+
+        sendReady(game.player2);
     }
 }
 
@@ -3071,44 +2805,35 @@ void sendPokerStateTo(
     PokerGame& game,
     Socket player
 ) {
+    Socket opponent = otherPokerPlayer(game, player);
+
     string state =
         pokerStageName(game.stage) + "|" +
+        getName(opponent) + "|" +
+        to_string(pokerChips(game, player)) + "|" +
+        to_string(pokerChips(game, opponent)) + "|" +
         to_string(game.pot) + "|" +
+        to_string(pokerRoundBet(game, player)) + "|" +
+        to_string(pokerRoundBet(game, opponent)) + "|" +
         to_string(game.currentBet) + "|" +
         (game.turn == INVALID_SOCK ? string("") : getName(game.turn)) + "|" +
-        (game.dealer == INVALID_SOCK ? string("") : getName(game.dealer)) + "|" +
-        (game.smallBlindPlayer == INVALID_SOCK ? string("") : getName(game.smallBlindPlayer)) + "|" +
-        (game.bigBlindPlayer == INVALID_SOCK ? string("") : getName(game.bigBlindPlayer)) + "|" +
+        getName(game.dealer) + "|" +
         to_string(game.smallBlind) + "|" +
         to_string(game.bigBlind) + "|" +
         (game.handActive ? "1" : "0") + "|" +
         to_string(game.handNumber) + "|" +
-        to_string(game.lastRaiseSize) + "|" +
-        to_string(pokerMaximumRaiseTo(game, player)) + "|" +
-        to_string(seatedPokerPlayers(game));
+        to_string(game.lastRaiseSize);
 
-    for (const PokerGame::Player& seat : game.players) {
-        if (seat.left)
-            continue;
-        state +=
-            "|" + seat.name +
-            "|" + to_string(seat.chips) +
-            "|" + to_string(seat.roundBet) +
-            "|" + (seat.folded ? "1" : "0") +
-            "|" + (seat.chips == 0 ? "1" : "0");
-    }
-
-    sendPacket(player, "POKER_HOST", getName(game.host));
     sendPacket(player, "POKER_STATE", state);
 
-    const PokerGame::Player* seat = pokerPlayer(game, player);
+    vector<Card>& hole = pokerHole(game, player);
 
     string holeData = "--|--";
 
-    if (seat && seat->hole.size() >= 2) {
+    if (hole.size() >= 2) {
         holeData =
-            pokerCardCode(seat->hole[0]) + "|" +
-            pokerCardCode(seat->hole[1]);
+            pokerCardCode(hole[0]) + "|" +
+            pokerCardCode(hole[1]);
     }
 
     sendPacket(player, "POKER_HOLE", holeData);
@@ -3129,194 +2854,45 @@ void sendPokerStateTo(
 }
 
 void sendPokerState(PokerGame& game) {
-    for (const PokerGame::Player& player : game.players) {
-        if (player.left)
-            continue;
-        sendPokerStateTo(game, player.socket);
-        sendReady(player.socket);
-    }
+    sendPokerStateTo(game, game.player1);
+    sendPokerStateTo(game, game.player2);
+    sendReady(game.player1);
+    sendReady(game.player2);
 }
 
 void sendPokerNotice(PokerGame& game, const string& text) {
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left)
-            sendPacket(player.socket, "POKER_NOTICE", text);
+    sendPacket(game.player1, "POKER_NOTICE", text);
+    sendPacket(game.player2, "POKER_NOTICE", text);
 }
 
 void sendPokerResult(PokerGame& game, const string& text) {
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left)
-            sendPacket(player.socket, "POKER_RESULT", text);
-}
-
-Socket previousSeatedPokerPlayer(
-    const PokerGame& game,
-    Socket before
-) {
-    if (game.players.empty())
-        return INVALID_SOCK;
-
-    int start = pokerPlayerIndex(game, before);
-    if (start < 0)
-        start = 0;
-
-    for (int offset = 1; offset <= (int)game.players.size(); offset++) {
-        int index =
-            (start - offset + (int)game.players.size()) %
-            (int)game.players.size();
-
-        if (!game.players[index].left)
-            return game.players[index].socket;
-    }
-
-    return INVALID_SOCK;
-}
-
-void purgeDepartedPokerPlayers(PokerGame& game) {
-    const PokerGame::Player* dealer = pokerPlayer(game, game.dealer);
-    if (dealer && dealer->left)
-        game.dealer = previousSeatedPokerPlayer(game, game.dealer);
-
-    for (const PokerGame::Player& player : game.players) {
-        if (!player.left)
-            continue;
-
-        PokerGame::Standing standing;
-        standing.name = player.name;
-        standing.chips = player.chips;
-        game.departedStandings.push_back(standing);
-    }
-
-    game.players.erase(
-        remove_if(
-            game.players.begin(),
-            game.players.end(),
-            [](const PokerGame::Player& player) {
-                return player.left;
-            }
-        ),
-        game.players.end()
-    );
-
-    if (pokerPlayerIndex(game, game.host) < 0)
-        game.host = game.players.empty()
-            ? INVALID_SOCK
-            : game.players.front().socket;
-}
-
-string pokerLeaderboardData(const PokerGame& game) {
-    vector<PokerGame::Standing> ranked;
-    vector<PokerGame::Standing> leavers;
-
-    for (const PokerGame::Player& player : game.players) {
-        if (player.left)
-            continue;
-
-        PokerGame::Standing standing;
-        standing.name = player.name;
-        standing.chips = player.chips;
-        standing.left = false;
-        ranked.push_back(standing);
-    }
-
-    sort(
-        ranked.begin(),
-        ranked.end(),
-        [](const PokerGame::Standing& left, const PokerGame::Standing& right) {
-            if (left.chips != right.chips)
-                return left.chips > right.chips;
-            return left.name < right.name;
-        }
-    );
-
-    // A player who returned to the table is represented by the current seat,
-    // not by an older departure record. Repeated departures also collapse to
-    // one entry, with the most recent chip count retained.
-    for (const PokerGame::Standing& departed : game.departedStandings) {
-        bool currentlySeated = any_of(
-            ranked.begin(),
-            ranked.end(),
-            [&](const PokerGame::Standing& standing) {
-                return lowerCopy(standing.name) == lowerCopy(departed.name);
-            }
-        );
-        if (currentlySeated)
-            continue;
-
-        auto existing = find_if(
-            leavers.begin(),
-            leavers.end(),
-            [&](const PokerGame::Standing& standing) {
-                return lowerCopy(standing.name) == lowerCopy(departed.name);
-            }
-        );
-
-        if (existing == leavers.end()) {
-            PokerGame::Standing standing = departed;
-            standing.left = true;
-            leavers.push_back(standing);
-        }
-        else {
-            existing->chips = departed.chips;
-        }
-    }
-
-    sort(
-        leavers.begin(),
-        leavers.end(),
-        [](const PokerGame::Standing& left, const PokerGame::Standing& right) {
-            return left.name < right.name;
-        }
-    );
-
-    vector<PokerGame::Standing> standings = ranked;
-    standings.insert(standings.end(), leavers.begin(), leavers.end());
-
-    string data =
-        to_string(game.startingChips) + "|" +
-        to_string(standings.size());
-
-    for (const PokerGame::Standing& standing : standings) {
-        data +=
-            "|" + standing.name +
-            "|" + to_string(standing.chips) +
-            "|" + (standing.left ? "1" : "0");
-    }
-
-    return data;
-}
-
-void endPokerMatch(int gameIndex, const string& result) {
-    if (gameIndex < 0 || gameIndex >= (int)pokerGames.size())
-        return;
-
-    PokerGame& game = pokerGames[gameIndex];
-    purgeDepartedPokerPlayers(game);
-    string leaderboard = pokerLeaderboardData(game);
-
-    for (const PokerGame::Player& player : game.players) {
-        sendPacket(player.socket, "POKER_LEADERBOARD", leaderboard);
-        sendPacket(player.socket, "POKER_END", result);
-        sendReady(player.socket);
-    }
-
-    pokerGames.erase(pokerGames.begin() + gameIndex);
+    sendPacket(game.player1, "POKER_RESULT", text);
+    sendPacket(game.player2, "POKER_RESULT", text);
 }
 
 void sendPokerReveal(PokerGame& game) {
-    for (const PokerGame::Player& revealed : game.players) {
-        if (revealed.left || revealed.folded || revealed.hole.size() < 2)
-            continue;
-
-        string data =
-            revealed.name + "|" +
-            pokerCardCode(revealed.hole[0]) + "|" +
-            pokerCardCode(revealed.hole[1]);
-
-        for (const PokerGame::Player& viewer : game.players)
-            if (!viewer.left)
-                sendPacket(viewer.socket, "POKER_REVEAL", data);
+    if (
+        game.player1Hole.size() < 2 ||
+        game.player2Hole.size() < 2
+    ) {
+        return;
     }
+
+    sendPacket(
+        game.player1,
+        "POKER_REVEAL",
+        getName(game.player2) + "|" +
+        pokerCardCode(game.player2Hole[0]) + "|" +
+        pokerCardCode(game.player2Hole[1])
+    );
+
+    sendPacket(
+        game.player2,
+        "POKER_REVEAL",
+        getName(game.player1) + "|" +
+        pokerCardCode(game.player1Hole[0]) + "|" +
+        pokerCardCode(game.player1Hole[1])
+    );
 }
 
 uint64_t packPokerScore(
@@ -3475,68 +3051,35 @@ string pokerHandName(uint64_t score) {
 }
 
 void normalizePokerUncalledBet(PokerGame& game) {
-    int highest = 0;
-    int secondHighest = 0;
-    PokerGame::Player* highestPlayer = nullptr;
-    bool tiedForHighest = false;
+    if (
+        game.player1Chips == 0 &&
+        game.player2RoundBet > game.player1RoundBet
+    ) {
+        int refund =
+            game.player2RoundBet -
+            game.player1RoundBet;
 
-    for (PokerGame::Player& player : game.players) {
-        if (player.roundBet > highest) {
-            secondHighest = highest;
-            highest = player.roundBet;
-            highestPlayer = &player;
-            tiedForHighest = false;
-        }
-        else if (player.roundBet == highest) {
-            tiedForHighest = true;
-        }
-        else {
-            secondHighest = max(secondHighest, player.roundBet);
-        }
-    }
-
-    if (highestPlayer && !tiedForHighest && highest > secondHighest) {
-        int refund = highest - secondHighest;
-        highestPlayer->roundBet -= refund;
-        highestPlayer->handContribution -= refund;
-        highestPlayer->chips += refund;
+        game.player2RoundBet -= refund;
+        game.player2Chips += refund;
         game.pot -= refund;
-        highest = secondHighest;
     }
 
-    game.currentBet = highest;
-}
+    if (
+        game.player2Chips == 0 &&
+        game.player1RoundBet > game.player2RoundBet
+    ) {
+        int refund =
+            game.player1RoundBet -
+            game.player2RoundBet;
 
-void finishPokerHand(PokerGame& game, const string& result) {
-    game.pot = 0;
-    game.handActive = false;
-    game.turn = INVALID_SOCK;
-    game.stage = PokerStage::SHOWDOWN;
-    game.phase = "RESULT";
-    game.status = result;
-    purgeDepartedPokerPlayers(game);
-    sendPokerState(game);
-    sendPokerResult(game, result);
-}
-
-void awardPokerFoldWin(PokerGame& game) {
-    PokerGame::Player* winner = nullptr;
-    for (PokerGame::Player& player : game.players) {
-        if (!player.left && !player.folded) {
-            winner = &player;
-            break;
-        }
+        game.player1RoundBet -= refund;
+        game.player1Chips += refund;
+        game.pot -= refund;
     }
 
-    if (!winner)
-        return;
-
-    int won = game.pot;
-    winner->chips += won;
-    finishPokerHand(
-        game,
-        winner->name + " wins " + to_string(won) +
-        " chips; all other players folded."
+    game.currentBet = max(
+        game.player1RoundBet,
+        game.player2RoundBet
     );
 }
 
@@ -3545,137 +3088,69 @@ void pokerShowdown(PokerGame& game) {
         game.community.push_back(drawPokerCard(game));
 
     normalizePokerUncalledBet(game);
+
+    uint64_t player1Score = evaluatePokerBest(
+        game.player1Hole,
+        game.community
+    );
+
+    uint64_t player2Score = evaluatePokerBest(
+        game.player2Hole,
+        game.community
+    );
+
     sendPokerReveal(game);
 
-    vector<int> levels;
-    for (const PokerGame::Player& player : game.players)
-        if (player.handContribution > 0)
-            levels.push_back(player.handContribution);
-
-    sort(levels.begin(), levels.end());
-    levels.erase(unique(levels.begin(), levels.end()), levels.end());
-
-    int previous = 0;
-    vector<string> winnersSummary;
-
-    for (int level : levels) {
-        int contributors = 0;
-        vector<int> eligible;
-
-        for (int i = 0; i < (int)game.players.size(); i++) {
-            const PokerGame::Player& player = game.players[i];
-            if (player.handContribution >= level)
-                contributors++;
-            if (!player.left && !player.folded && player.handContribution >= level)
-                eligible.push_back(i);
-        }
-
-        int sidePot = (level - previous) * contributors;
-        previous = level;
-        if (sidePot <= 0 || eligible.empty())
-            continue;
-
-        uint64_t best = 0;
-        vector<int> winners;
-        for (int index : eligible) {
-            uint64_t score = evaluatePokerBest(
-                game.players[index].hole,
-                game.community
-            );
-            if (winners.empty() || score > best) {
-                best = score;
-                winners = {index};
-            }
-            else if (score == best) {
-                winners.push_back(index);
-            }
-        }
-
-        int share = sidePot / (int)winners.size();
-        int odd = sidePot % (int)winners.size();
-        for (int index : winners)
-            game.players[index].chips += share;
-
-        int dealerIndex = pokerPlayerIndex(game, game.dealer);
-        for (int offset = 1; odd > 0 && offset <= (int)game.players.size(); offset++) {
-            int index = (dealerIndex + offset) % game.players.size();
-            if (find(winners.begin(), winners.end(), index) != winners.end()) {
-                game.players[index].chips++;
-                odd--;
-            }
-        }
-
-        string names;
-        for (int index : winners) {
-            if (!names.empty())
-                names += winners.size() == 2 ? " and " : ", ";
-            names += game.players[index].name;
-        }
-
-        winnersSummary.push_back(
-            names + " win" + (winners.size() == 1 ? "s " : " ") +
-            to_string(sidePot) + " with " + pokerHandName(best)
-        );
-    }
-
     string result;
-    for (int i = 0; i < (int)winnersSummary.size(); i++) {
-        if (i > 0)
-            result += " | ";
-        result += winnersSummary[i];
-    }
-    if (result.empty())
-        result = "Poker hand complete.";
 
-    finishPokerHand(game, result + ".");
+    if (player1Score > player2Score) {
+        game.player1Chips += game.pot;
+        result =
+            getName(game.player1) +
+            " wins " +
+            to_string(game.pot) +
+            " chips with " +
+            pokerHandName(player1Score) +
+            ".";
+    }
+    else if (player2Score > player1Score) {
+        game.player2Chips += game.pot;
+        result =
+            getName(game.player2) +
+            " wins " +
+            to_string(game.pot) +
+            " chips with " +
+            pokerHandName(player2Score) +
+            ".";
+    }
+    else {
+        int half = game.pot / 2;
+        int oddChip = game.pot % 2;
+
+        game.player1Chips += half;
+        game.player2Chips += half;
+        pokerChips(game, game.dealer) += oddChip;
+
+        result =
+            "Split pot - both players have " +
+            pokerHandName(player1Score) +
+            ".";
+    }
+
+    game.pot = 0;
+    game.handActive = false;
+    game.turn = INVALID_SOCK;
+    game.stage = PokerStage::SHOWDOWN;
+
+    sendPokerState(game);
+    sendPokerResult(game, result);
 }
 
 void runOutPokerBoard(PokerGame& game) {
     while (game.community.size() < 5)
         game.community.push_back(drawPokerCard(game));
+
     pokerShowdown(game);
-}
-
-int pokerPlayersAbleToAct(const PokerGame& game) {
-    int count = 0;
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left && !player.folded && player.chips > 0)
-            count++;
-    return count;
-}
-
-Socket nextPokerActor(const PokerGame& game, Socket after) {
-    if (game.players.empty())
-        return INVALID_SOCK;
-
-    int start = pokerPlayerIndex(game, after);
-    for (int offset = 1; offset <= (int)game.players.size(); offset++) {
-        const PokerGame::Player& player =
-            game.players[(start + offset) % game.players.size()];
-        if (
-            !player.left &&
-            !player.folded &&
-            player.chips > 0 &&
-            (!player.acted || player.roundBet < game.currentBet)
-        ) {
-            return player.socket;
-        }
-    }
-    return INVALID_SOCK;
-}
-
-bool pokerBettingRoundComplete(const PokerGame& game) {
-    for (const PokerGame::Player& player : game.players) {
-        if (
-            !player.left &&
-            !player.folded &&
-            player.chips > 0 &&
-            (!player.acted || player.roundBet != game.currentBet)
-        ) {
-            return false;
-        }
-    }
-    return true;
 }
 
 void startPokerHand(PokerGame& game) {
@@ -3684,104 +3159,86 @@ void startPokerHand(PokerGame& game) {
     game.stage = PokerStage::PREFLOP;
     game.handActive = true;
     game.turn = INVALID_SOCK;
+
     game.deck = makePokerDeck();
+    game.player1Hole.clear();
+    game.player2Hole.clear();
     game.community.clear();
+
     game.pot = 0;
+    game.player1RoundBet = 0;
+    game.player2RoundBet = 0;
     game.currentBet = 0;
     game.lastRaiseSize = game.bigBlind;
+    game.player1Acted = false;
+    game.player2Acted = false;
 
-    for (PokerGame::Player& player : game.players) {
-        if (player.left)
-            continue;
-        player.roundBet = 0;
-        player.handContribution = 0;
-        player.acted = player.chips == 0;
-        player.folded = player.chips == 0;
-        player.hole.clear();
-    }
+    game.player1Hole.push_back(drawPokerCard(game));
+    game.player2Hole.push_back(drawPokerCard(game));
+    game.player1Hole.push_back(drawPokerCard(game));
+    game.player2Hole.push_back(drawPokerCard(game));
 
-    vector<Socket> funded;
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left && player.chips > 0)
-            funded.push_back(player.socket);
+    Socket smallBlindPlayer = game.dealer;
+    Socket bigBlindPlayer = otherPokerPlayer(
+        game,
+        game.dealer
+    );
 
-    if (funded.size() < 2) {
-        game.handActive = false;
-        return;
-    }
+    int smallAmount = min(
+        game.smallBlind,
+        pokerChips(game, smallBlindPlayer)
+    );
 
-    if (pokerPlayerIndex(game, game.dealer) < 0 ||
-        !pokerPlayer(game, game.dealer) ||
-        pokerPlayer(game, game.dealer)->left ||
-        pokerPlayer(game, game.dealer)->chips <= 0) {
-        game.dealer = funded.front();
-    }
+    pokerChips(game, smallBlindPlayer) -= smallAmount;
+    pokerRoundBet(game, smallBlindPlayer) += smallAmount;
+    game.pot += smallAmount;
 
-    if (funded.size() == 2) {
-        game.smallBlindPlayer = game.dealer;
-        game.bigBlindPlayer = nextPokerPlayer(game, game.dealer, true, false);
-    }
-    else {
-        game.smallBlindPlayer = nextPokerPlayer(game, game.dealer, true, false);
-        game.bigBlindPlayer = nextPokerPlayer(game, game.smallBlindPlayer, true, false);
-    }
+    int bigAmount = min(
+        game.bigBlind,
+        pokerChips(game, bigBlindPlayer)
+    );
 
-    Socket dealFrom = game.dealer;
-    for (int card = 0; card < 2; card++) {
-        Socket seat = dealFrom;
-        for (int count = 0; count < (int)funded.size(); count++) {
-            seat = nextPokerPlayer(game, seat, true, false);
-            pokerPlayer(game, seat)->hole.push_back(drawPokerCard(game));
-        }
-    }
+    pokerChips(game, bigBlindPlayer) -= bigAmount;
+    pokerRoundBet(game, bigBlindPlayer) += bigAmount;
+    game.pot += bigAmount;
 
-    auto postBlind = [&](Socket socket, int blind) {
-        PokerGame::Player* player = pokerPlayer(game, socket);
-        int amount = min(blind, player->chips);
-        player->chips -= amount;
-        player->roundBet += amount;
-        player->handContribution += amount;
-        game.pot += amount;
-    };
+    normalizePokerUncalledBet(game);
 
-    postBlind(game.smallBlindPlayer, game.smallBlind);
-    postBlind(game.bigBlindPlayer, game.bigBlind);
+    game.currentBet = max(
+        game.player1RoundBet,
+        game.player2RoundBet
+    );
 
-    for (PokerGame::Player& player : game.players)
-        if (!player.left)
-            player.acted = player.folded || player.chips == 0;
+    game.player1Acted = game.player1Chips == 0;
+    game.player2Acted = game.player2Chips == 0;
 
-    for (const PokerGame::Player& player : game.players)
-        if (!player.left)
-            game.currentBet = max(game.currentBet, player.roundBet);
-
-    if (pokerPlayersAbleToAct(game) == 0) {
+    if (
+        game.player1Chips == 0 ||
+        game.player2Chips == 0
+    ) {
         runOutPokerBoard(game);
         return;
     }
 
-    game.turn = nextPokerActor(game, game.bigBlindPlayer);
-    if (game.turn == INVALID_SOCK) {
-        runOutPokerBoard(game);
-        return;
-    }
+    // Heads-up: dealer / small blind acts first preflop.
+    game.turn = game.dealer;
 
     sendPokerState(game);
     sendPokerNotice(
         game,
-        "Hand " + to_string(game.handNumber) + " - cards dealt."
+        "Hand " +
+        to_string(game.handNumber) +
+        " - cards dealt."
     );
 }
 
 void advancePokerStreet(PokerGame& game) {
-    for (PokerGame::Player& player : game.players) {
-        if (player.left)
-            continue;
-        player.roundBet = 0;
-        player.acted = player.folded || player.chips == 0;
-    }
+    game.player1RoundBet = 0;
+    game.player2RoundBet = 0;
     game.currentBet = 0;
     game.lastRaiseSize = game.bigBlind;
+    game.player1Acted = game.player1Chips == 0;
+    game.player2Acted = game.player2Chips == 0;
 
     if (game.stage == PokerStage::PREFLOP) {
         game.stage = PokerStage::FLOP;
@@ -3802,133 +3259,64 @@ void advancePokerStreet(PokerGame& game) {
         return;
     }
 
-    if (pokerPlayersAbleToAct(game) <= 1) {
+    if (
+        game.player1Chips == 0 ||
+        game.player2Chips == 0
+    ) {
         runOutPokerBoard(game);
         return;
     }
 
-    game.turn = nextPokerActor(game, game.dealer);
-    if (game.turn == INVALID_SOCK) {
-        runOutPokerBoard(game);
-        return;
-    }
+    // Heads-up: the non-dealer acts first after the flop.
+    game.turn = otherPokerPlayer(
+        game,
+        game.dealer
+    );
+
     sendPokerState(game);
 }
 
-void finishPokerAction(PokerGame& game, Socket actor) {
-    if (activePokerPlayers(game) == 1) {
-        awardPokerFoldWin(game);
-        return;
-    }
-
-    if (pokerBettingRoundComplete(game)) {
-        normalizePokerUncalledBet(game);
-        if (pokerPlayersAbleToAct(game) <= 1)
-            runOutPokerBoard(game);
-        else
-            advancePokerStreet(game);
-        return;
-    }
-
-    game.turn = nextPokerActor(game, actor);
-    if (game.turn == INVALID_SOCK) {
-        normalizePokerUncalledBet(game);
-        runOutPokerBoard(game);
-        return;
-    }
-    sendPokerState(game);
-}
-
-void removePokerPlayerFromMatch(
-    int gameIndex,
-    Socket socket,
-    const string& name,
-    bool notifyDepartingPlayer
+void finishPokerAction(
+    PokerGame& game,
+    Socket actor
 ) {
-    if (gameIndex < 0 || gameIndex >= (int)pokerGames.size())
-        return;
+    normalizePokerUncalledBet(game);
 
-    PokerGame& game = pokerGames[gameIndex];
-    PokerGame::Player* player = pokerPlayer(game, socket);
-    if (!player || player->left)
-        return;
-
-    bool wasTurn = game.handActive && game.turn == socket;
-
-    // Keep the folded record internally until the current hand settles so
-    // chips already committed by the departing player remain in every pot.
-    player->left = true;
-    player->folded = true;
-    player->acted = true;
-
-    Socket previous = previousSeatedPokerPlayer(game, socket);
-
-    if (notifyDepartingPlayer) {
-        sendPacket(
-            socket,
-            "POKER_END",
-            "You left the Poker table."
-        );
-        sendReady(socket);
-    }
-
-    sendPokerNotice(game, name + " left the Poker table.");
-
-    if (!game.handActive)
-        purgeDepartedPokerPlayers(game);
-
-    if (seatedPokerPlayers(game) < 2) {
-        if (game.handActive && activePokerPlayers(game) == 1)
-            awardPokerFoldWin(game);
-
-        string winner;
-        for (const PokerGame::Player& remaining : game.players) {
-            if (!remaining.left) {
-                winner = remaining.name;
-                break;
-            }
-        }
-
-        string result = winner.empty()
-            ? "Poker match ended."
-            : winner + " wins the Poker match.";
-
-        endPokerMatch(gameIndex, result);
+    if (
+        game.player1RoundBet == game.player2RoundBet &&
+        (
+            game.player1Chips == 0 ||
+            game.player2Chips == 0
+        )
+    ) {
+        runOutPokerBoard(game);
         return;
     }
 
-    if (!game.handActive) {
-        game.status =
-            name +
-            " left between hands. " +
-            to_string(seatedPokerPlayers(game)) +
-            " players remain.";
-        sendPokerState(game);
-        sendPokerNotice(game, game.status);
+    bool roundComplete =
+        game.player1Acted &&
+        game.player2Acted &&
+        game.player1RoundBet == game.player2RoundBet;
+
+    if (roundComplete) {
+        advancePokerStreet(game);
         return;
     }
 
-    if (activePokerPlayers(game) == 1) {
-        awardPokerFoldWin(game);
-        return;
-    }
+    Socket next = otherPokerPlayer(game, actor);
 
-    if (wasTurn) {
-        finishPokerAction(game, previous);
-        return;
+    if (pokerChips(game, next) == 0) {
+        game.turn = actor;
     }
-
-    if (pokerBettingRoundComplete(game)) {
-        normalizePokerUncalledBet(game);
-        if (pokerPlayersAbleToAct(game) <= 1)
-            runOutPokerBoard(game);
-        else
-            advancePokerStreet(game);
-        return;
+    else {
+        game.turn = next;
     }
 
     sendPokerState(game);
 }
+
+
+// ============================================================
 // JENG ARENA LOBBY HELPERS
 // ============================================================
 
@@ -5240,29 +4628,8 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        int startingChips = 0;
-        int rounds = 0;
-
-        try {
-            size_t chipsLength = 0;
-            size_t roundsLength = 0;
-            startingChips = stoi(fields[0], &chipsLength);
-            rounds = stoi(fields[1], &roundsLength);
-
-            if (
-                chipsLength != fields[0].size() ||
-                roundsLength != fields[1].size()
-            ) {
-                throw invalid_argument("trailing characters");
-            }
-        }
-        catch (...) {
-            sendRouletteError(
-                client.socket,
-                "Starting chips and rounds must be whole numbers."
-            );
-            return;
-        }
+        int startingChips = stoi(fields[0]);
+        int rounds = stoi(fields[1]);
 
         if (
             startingChips <= 0 ||
@@ -5792,119 +5159,6 @@ void handleCommand(Client& client, const string& line) {
     }
 
     // --------------------------------------------------------
-    // Invite another online user to watch an active Chess game.
-    // Either player may invite; spectators may not invite others.
-    // --------------------------------------------------------
-    if (line.rfind("CHESS_SPECTATE_INVITE|", 0) == 0) {
-        string targetName = line.substr(22);
-        int chessIndex = findChessGame(client.socket);
-
-        if (chessIndex == -1 ||
-            !chessIsPlayer(chessGames[chessIndex], client.socket)) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                "Only an active Chess player can invite spectators."
-            );
-            return;
-        }
-
-        ChessGame& game = chessGames[chessIndex];
-
-        if ((int)game.spectators.size() >= 8) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                "This Chess game already has eight spectators."
-            );
-            return;
-        }
-
-        Client* target = getClientByName(targetName);
-
-        if (!target || target->socket == client.socket) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                target ? "You cannot invite yourself." : "User not found."
-            );
-            return;
-        }
-
-        if (isPlayerBusy(target->socket)) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                target->name + " is already in a game."
-            );
-            return;
-        }
-
-        if (target->pendingChallenge != INVALID_SOCK) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                target->name + " already has a pending invitation."
-            );
-            return;
-        }
-
-        target->pendingChallenge = client.socket;
-        target->pendingGame = "chess_spectate";
-        target->pendingChips = 0;
-        target->pendingHands = 0;
-
-        sendPacket(
-            target->socket,
-            "CHESS_SPECTATE_CHALLENGE",
-            client.name + "|" +
-            getName(game.white) + "|" +
-            getName(game.black)
-        );
-        sendPacket(
-            client.socket,
-            "CHESS_NOTICE",
-            "Spectator invitation sent to " + target->name + "."
-        );
-        sendReady(target->socket);
-        return;
-    }
-
-    if (line == "CHESS_SPECTATE_LEAVE") {
-        int chessIndex = findChessGame(client.socket);
-
-        if (chessIndex == -1 ||
-            !chessIsSpectator(chessGames[chessIndex], client.socket)) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                "You are not spectating a Chess game."
-            );
-            return;
-        }
-
-        ChessGame& game = chessGames[chessIndex];
-        game.spectators.erase(
-            remove(
-                game.spectators.begin(),
-                game.spectators.end(),
-                client.socket
-            ),
-            game.spectators.end()
-        );
-
-        sendPacket(
-            client.socket,
-            "CHESS_END",
-            "You stopped spectating the Chess game."
-        );
-        sendReady(client.socket);
-        sendChessState(game);
-        readyChessPlayers(game);
-        return;
-    }
-
-    // --------------------------------------------------------
     // Graphical Chess legal-move request
     // CHESS_LEGAL|e2
     // --------------------------------------------------------
@@ -5922,15 +5176,6 @@ void handleCommand(Client& client, const string& line) {
                 client.socket,
                 "CHESS_ERROR",
                 "You are not in a Chess game."
-            );
-            return;
-        }
-
-        if (!chessIsPlayer(chessGames[chessIndex], client.socket)) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                "Spectators cannot select or move Chess pieces."
             );
             return;
         }
@@ -5974,15 +5219,6 @@ void handleCommand(Client& client, const string& line) {
                 client.socket,
                 "CHESS_ERROR",
                 "You are not in a Chess game."
-            );
-            return;
-        }
-
-        if (!chessIsPlayer(chessGames[chessIndex], client.socket)) {
-            sendPacket(
-                client.socket,
-                "CHESS_ERROR",
-                "Spectators cannot move Chess pieces."
             );
             return;
         }
@@ -6744,25 +5980,16 @@ void handleCommand(Client& client, const string& line) {
     }
 
 
-    // Return a structured online-player roster for the Players and Invite menus.
-    // This must be handled before normal chat so USERS_REQUEST is not broadcast.
     if (workingLine == "USERS_REQUEST") {
         string roster;
-
         for (const Client& user : clients) {
-            if (user.name.empty())
-                continue;
-
-            if (!roster.empty())
-                roster += "|";
-
+            if (user.name.empty()) continue;
+            if (!roster.empty()) roster += "|";
             roster += user.name;
         }
-
         sendPacket(client.socket, "USERS_LIST", roster);
         return;
     }
-
 
     // --------------------------------------------------------
     // NORMAL CHAT
@@ -6808,103 +6035,6 @@ void handleCommand(Client& client, const string& line) {
             "SYS",
             result
         );
-    }
-
-
-    // --------------------------------------------------------
-    // /ttt <username>
-    // --------------------------------------------------------
-
-    else if (command == "/ttt") {
-        string targetName;
-        ss >> targetName;
-
-        if (targetName.empty()) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "Usage: /ttt <username>"
-            );
-            return;
-        }
-
-        if (isPlayerBusy(client.socket)) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You are already in a game."
-            );
-            return;
-        }
-
-        Client* target = getClientByName(targetName);
-
-        if (!target) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "User not found."
-            );
-            return;
-        }
-
-        if (target->socket == client.socket) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You cannot challenge yourself."
-            );
-            return;
-        }
-
-        if (isPlayerBusy(target->socket)) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                target->name +
-                " is already playing."
-            );
-            return;
-        }
-
-        if (target->pendingChallenge != INVALID_SOCK) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                target->name +
-                " already has a pending challenge."
-            );
-            return;
-        }
-
-        target->pendingChallenge = client.socket;
-        target->pendingGame = "ttt";
-        target->pendingChips = 0;
-        target->pendingHands = 0;
-
-        sendPacket(
-            client.socket,
-            "GAME",
-            "Tic-Tac-Toe challenge sent to " +
-            target->name +
-            "."
-        );
-
-        sendPacket(
-            target->socket,
-            "GAME",
-            "*** " +
-            client.name +
-            " challenged you to Tic-Tac-Toe! ***"
-        );
-
-        sendPacket(
-            target->socket,
-            "GAME",
-            "Type /accept or /decline"
-        );
-
-        sendReady(target->socket);
     }
 
 
@@ -7326,7 +6456,7 @@ void handleCommand(Client& client, const string& line) {
 
     // --------------------------------------------------------
     // /pokercreate <starting_chips> <small_blind>
-    // Create the table first, then invite up to five players from the lobby.
+    // Create the table first, then invite a player from the lobby.
     // --------------------------------------------------------
 
     else if (command == "/pokercreate") {
@@ -7369,19 +6499,17 @@ void handleCommand(Client& client, const string& line) {
 
         PokerGame game;
         game.host = client.socket;
+        game.player1 = client.socket;
+        game.player2 = INVALID_SOCK;
         game.startingChips = startingChips;
+        game.player1Chips = startingChips;
+        game.player2Chips = startingChips;
         game.smallBlind = smallBlind;
         game.bigBlind = bigBlind;
         game.dealer = client.socket;
         game.phase = "LOBBY";
         game.status =
-            "Table created. Invite up to five players to join.";
-
-        PokerGame::Player hostPlayer;
-        hostPlayer.socket = client.socket;
-        hostPlayer.name = client.name;
-        hostPlayer.chips = startingChips;
-        game.players.push_back(hostPlayer);
+            "Table created. Invite a player to join.";
 
         pokerGames.push_back(game);
 
@@ -7395,7 +6523,7 @@ void handleCommand(Client& client, const string& line) {
 
     // --------------------------------------------------------
     // /poker <username>
-    // Invite another player to an already-created Poker table.
+    // Invite a player to an already-created Poker table.
     // --------------------------------------------------------
 
     else if (command == "/poker") {
@@ -7428,27 +6556,23 @@ void handleCommand(Client& client, const string& line) {
         PokerGame& game =
             pokerGames[gameIndex];
 
-        bool betweenHands =
-            game.phase == "RESULT" &&
-            !game.handActive;
-
         if (
             game.host != client.socket ||
-            (game.phase != "LOBBY" && !betweenHands)
+            game.phase != "LOBBY"
         ) {
             sendPacket(
                 client.socket,
                 "ERR",
-                "Only the host can invite players before the match or between hands."
+                "Only the host can invite a player before the Poker match starts."
             );
             return;
         }
 
-        if (seatedPokerPlayers(game) >= 6) {
+        if (game.player2 != INVALID_SOCK) {
             sendPacket(
                 client.socket,
                 "ERR",
-                "This Poker table already has six players."
+                "This heads-up Poker table already has two players."
             );
             return;
         }
@@ -7525,13 +6649,7 @@ void handleCommand(Client& client, const string& line) {
             target->name +
             ".";
 
-        if (game.phase == "LOBBY") {
-            sendPokerLobbyState(game);
-        }
-        else {
-            sendPokerState(game);
-            sendPokerNotice(game, game.status);
-        }
+        sendPokerLobbyState(game);
         sendReady(target->socket);
         return;
     }
@@ -7577,11 +6695,11 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        if (game.players.size() < 2) {
+        if (game.player2 == INVALID_SOCK) {
             sendPacket(
                 client.socket,
                 "ERR",
-                "Invite at least one player before starting the Poker match."
+                "Invite a player before starting the Poker match."
             );
             return;
         }
@@ -7626,54 +6744,6 @@ void handleCommand(Client& client, const string& line) {
 
         Socket challengerSocket = challenger->socket;
         Socket accepterSocket = client.socket;
-
-        if (gameType == "chess_spectate") {
-            if (isPlayerBusy(accepterSocket)) {
-                clearPendingChallenge(client);
-                sendPacket(
-                    accepterSocket,
-                    "CHESS_ERROR",
-                    "You are already in a game."
-                );
-                return;
-            }
-
-            int chessIndex = findChessGame(challengerSocket);
-
-            if (chessIndex == -1 ||
-                !chessIsPlayer(chessGames[chessIndex], challengerSocket)) {
-                clearPendingChallenge(client);
-                sendPacket(
-                    accepterSocket,
-                    "CHESS_ERROR",
-                    "That Chess game is no longer available."
-                );
-                return;
-            }
-
-            ChessGame& game = chessGames[chessIndex];
-
-            if ((int)game.spectators.size() >= 8) {
-                clearPendingChallenge(client);
-                sendPacket(
-                    accepterSocket,
-                    "CHESS_ERROR",
-                    "That Chess game already has eight spectators."
-                );
-                return;
-            }
-
-            game.spectators.push_back(accepterSocket);
-            clearPendingChallenge(client);
-
-            sendChessState(game);
-            sendChessLine(
-                game,
-                client.name + " joined as a spectator."
-            );
-            readyChessPlayers(game);
-            return;
-        }
 
         // Blackjack invitations join an existing host lobby. The host is
         // intentionally already considered busy because they own that table.
@@ -7857,25 +6927,21 @@ void handleCommand(Client& client, const string& line) {
             PokerGame& game =
                 pokerGames[pokerIndex];
 
-            bool betweenHands =
-                game.phase == "RESULT" &&
-                !game.handActive;
-
             if (
                 game.host != challengerSocket ||
-                (game.phase != "LOBBY" && !betweenHands)
+                game.phase != "LOBBY"
             ) {
                 clearPendingChallenge(client);
 
                 sendPacket(
                     accepterSocket,
                     "ERR",
-                    "That Poker table is not accepting players right now."
+                    "That Poker table has already started."
                 );
                 return;
             }
 
-            if (seatedPokerPlayers(game) >= 6) {
+            if (game.player2 != INVALID_SOCK) {
                 clearPendingChallenge(client);
 
                 sendPacket(
@@ -7886,33 +6952,19 @@ void handleCommand(Client& client, const string& line) {
                 return;
             }
 
-            PokerGame::Player player;
-            player.socket = accepterSocket;
-            player.name = client.name;
-            player.chips = game.startingChips;
-            game.players.push_back(player);
+            game.player2 =
+                accepterSocket;
+
+            game.player2Chips =
+                game.startingChips;
 
             clearPendingChallenge(client);
 
             game.status =
                 client.name +
-                " joined the Poker table. " +
-                to_string(seatedPokerPlayers(game)) +
-                "/6 players.";
+                " joined the Poker table. Host can start the match.";
 
-            if (game.phase == "LOBBY") {
-                sendPokerLobbyState(game);
-            }
-            else {
-                sendPokerState(game);
-                sendPokerNotice(
-                    game,
-                    client.name +
-                    " joined between hands with " +
-                    to_string(game.startingChips) +
-                    " chips."
-                );
-            }
+            sendPokerLobbyState(game);
             return;
         }
 
@@ -8021,35 +7073,7 @@ void handleCommand(Client& client, const string& line) {
 
         clearPendingChallenge(client);
 
-        if (gameType == "ttt") {
-            TicTacToeGame game;
-            game.playerX = challengerSocket;
-            game.playerO = accepterSocket;
-            game.turn = challengerSocket;
-
-            ticTacToeGames.push_back(game);
-
-            sendPacket(
-                challengerSocket,
-                "GAME",
-                client.name +
-                " accepted your Tic-Tac-Toe challenge!"
-            );
-
-            sendPacket(
-                accepterSocket,
-                "GAME",
-                "Challenge accepted!"
-            );
-
-            showTicTacToeBoard(
-                ticTacToeGames.back()
-            );
-
-            sendReady(challengerSocket);
-            sendReady(accepterSocket);
-        }
-        else if (gameType == "chess") {
+        if (gameType == "chess") {
             ChessGame game = makeChessGame(
                 challengerSocket,
                 accepterSocket
@@ -8107,10 +7131,7 @@ void handleCommand(Client& client, const string& line) {
 
         if (client.pendingGame == "blackjack")
             gameName = "Blackjack";
-        else if (
-            client.pendingGame == "chess" ||
-            client.pendingGame == "chess_spectate"
-        )
+        else if (client.pendingGame == "chess")
             gameName = "Chess";
         else if (client.pendingGame == "poker")
             gameName = "Poker";
@@ -8119,18 +7140,10 @@ void handleCommand(Client& client, const string& line) {
         else if (client.pendingGame == "arena")
             gameName = "JENG Arena";
         else
-            gameName = "Tic-Tac-Toe";
+            gameName = "Game";
 
         if (challenger) {
-            if (client.pendingGame == "chess_spectate") {
-                sendPacket(
-                    challenger->socket,
-                    "CHESS_NOTICE",
-                    client.name +
-                    " declined your Chess spectator invitation."
-                );
-            }
-            else if (client.pendingGame == "blackjack") {
+            if (client.pendingGame == "blackjack") {
                 sendPacket(
                     challenger->socket,
                     "BJ_NOTICE",
@@ -8177,7 +7190,6 @@ void handleCommand(Client& client, const string& line) {
         }
 
         bool wasBlackjack = client.pendingGame == "blackjack";
-        bool wasChessSpectate = client.pendingGame == "chess_spectate";
         bool wasRoulette = client.pendingGame == "roulette";
         bool wasPoker = client.pendingGame == "poker";
         bool wasArena = client.pendingGame == "arena";
@@ -8185,9 +7197,7 @@ void handleCommand(Client& client, const string& line) {
 
         sendPacket(
             client.socket,
-            wasChessSpectate
-                ? "CHESS_NOTICE"
-                : (wasBlackjack
+            wasBlackjack
                 ? "BJ_NOTICE"
                 : (
                     wasRoulette
@@ -8197,10 +7207,8 @@ void handleCommand(Client& client, const string& line) {
                         ? "POKER_NOTICE"
                         : (wasArena ? "ARENA_NOTICE" : "GAME")
                       )
-                  )),
-            wasChessSpectate
-                ? "Chess spectator invitation declined."
-                : (wasBlackjack
+                  ),
+            wasBlackjack
                 ? "Blackjack invitation declined."
                 : (
                     wasRoulette
@@ -8214,14 +7222,13 @@ void handleCommand(Client& client, const string& line) {
                             : "Challenge declined."
                           )
                       )
-                  ))
+                  )
         );
     }
 
 
     // --------------------------------------------------------
     // /move
-    // Tic-Tac-Toe: /move <1-9>
     // Chess:       /move <from> <to> [promotion]
     // --------------------------------------------------------
 
@@ -8257,127 +7264,7 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        int position;
-
-        if (!(ss >> position)) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "Tic-Tac-Toe: /move <1-9> | Chess: /move e2 e4"
-            );
-            return;
-        }
-
-        int gameIndex = findTicTacToeGame(
-            client.socket
-        );
-
-        if (gameIndex == -1) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You are not in a Tic-Tac-Toe or Chess game."
-            );
-            return;
-        }
-
-        TicTacToeGame& game =
-            ticTacToeGames[gameIndex];
-
-        if (game.turn != client.socket) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "It is not your turn."
-            );
-            return;
-        }
-
-        if (position < 1 || position > 9) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "Position must be 1 through 9."
-            );
-            return;
-        }
-
-        int index = position - 1;
-
-        if (game.board[index] != ' ') {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "That square is already taken."
-            );
-            return;
-        }
-
-        char symbol =
-            client.socket == game.playerX
-            ? 'X'
-            : 'O';
-
-        game.board[index] = symbol;
-
-        if (ticTacToeWinner(game, symbol)) {
-            Socket playerX = game.playerX;
-            Socket playerO = game.playerO;
-
-            showTicTacToeBoard(
-                game,
-                false
-            );
-
-            sendTicTacToeLine(
-                game,
-                "*** " +
-                client.name +
-                " WINS! ***"
-            );
-
-            sendReady(playerX);
-            sendReady(playerO);
-
-            ticTacToeGames.erase(
-                ticTacToeGames.begin() + gameIndex
-            );
-
-            return;
-        }
-
-        if (ticTacToeBoardFull(game)) {
-            Socket playerX = game.playerX;
-            Socket playerO = game.playerO;
-
-            showTicTacToeBoard(
-                game,
-                false
-            );
-
-            sendTicTacToeLine(
-                game,
-                "*** DRAW! ***"
-            );
-
-            sendReady(playerX);
-            sendReady(playerO);
-
-            ticTacToeGames.erase(
-                ticTacToeGames.begin() + gameIndex
-            );
-
-            return;
-        }
-
-        game.turn =
-            game.turn == game.playerX
-            ? game.playerO
-            : game.playerX;
-
-        showTicTacToeBoard(game);
-        sendReady(game.playerX);
-        sendReady(game.playerO);
+        sendPacket(client.socket, "CHESS_ERROR", "You are not in a Chess game.");
     }
 
     // --------------------------------------------------------
@@ -8396,23 +7283,7 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        int gameIndex = findTicTacToeGame(
-            client.socket
-        );
-
-        if (gameIndex == -1) {
-            sendPacket(
-                client.socket,
-                "ERR",
-                "You are not currently playing Tic-Tac-Toe or Chess."
-            );
-            return;
-        }
-
-        TicTacToeGame& game = ticTacToeGames[gameIndex];
-        showTicTacToeBoard(game);
-        sendReady(game.playerX);
-        sendReady(game.playerO);
+        sendPacket(client.socket, "CHESS_ERROR", "You are not in a Chess game.");
     }
 
     // --------------------------------------------------------
@@ -8905,14 +7776,12 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        PokerGame::Player* player = pokerPlayer(game, client.socket);
-
-        if (!player || player->roundBet != game.currentBet) {
+        if (pokerRoundBet(game, client.socket) != game.currentBet) {
             sendPacket(client.socket, "ERR", "You cannot check while facing a bet.");
             return;
         }
 
-        player->acted = true;
+        pokerActed(game, client.socket) = true;
         sendPokerNotice(game, client.name + " checks.");
         finishPokerAction(game, client.socket);
     }
@@ -8932,11 +7801,9 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        PokerGame::Player* player = pokerPlayer(game, client.socket);
-        if (!player)
-            return;
-
-        int amount = game.currentBet - player->roundBet;
+        int amount =
+            game.currentBet -
+            pokerRoundBet(game, client.socket);
 
         if (amount <= 0) {
             sendPacket(client.socket, "ERR", "There is nothing to call.");
@@ -8945,14 +7812,15 @@ void handleCommand(Client& client, const string& line) {
 
         int paid = min(
             amount,
-            player->chips
+            pokerChips(game, client.socket)
         );
 
-        player->chips -= paid;
-        player->roundBet += paid;
-        player->handContribution += paid;
+        pokerChips(game, client.socket) -= paid;
+        pokerRoundBet(game, client.socket) += paid;
         game.pot += paid;
-        player->acted = true;
+        pokerActed(game, client.socket) = true;
+
+        normalizePokerUncalledBet(game);
 
         sendPokerNotice(
             game,
@@ -8986,11 +7854,14 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        PokerGame::Player* player = pokerPlayer(game, client.socket);
-        if (!player)
-            return;
+        Socket opponent = otherPokerPlayer(game, client.socket);
 
-        int maximum = pokerMaximumRaiseTo(game, client.socket);
+        int maximum = min(
+            pokerRoundBet(game, client.socket) +
+                pokerChips(game, client.socket),
+            pokerRoundBet(game, opponent) +
+                pokerChips(game, opponent)
+        );
 
         if (maximum <= game.currentBet) {
             sendPacket(client.socket, "ERR", "No further raise is possible.");
@@ -9026,11 +7897,12 @@ void handleCommand(Client& client, const string& line) {
         }
 
         int oldCurrentBet = game.currentBet;
-        int payment = target - player->roundBet;
+        int payment =
+            target -
+            pokerRoundBet(game, client.socket);
 
-        player->chips -= payment;
-        player->roundBet = target;
-        player->handContribution += payment;
+        pokerChips(game, client.socket) -= payment;
+        pokerRoundBet(game, client.socket) = target;
         game.pot += payment;
         game.currentBet = target;
 
@@ -9039,16 +7911,8 @@ void handleCommand(Client& client, const string& line) {
         if (raiseSize >= game.lastRaiseSize)
             game.lastRaiseSize = raiseSize;
 
-        for (PokerGame::Player& other : game.players) {
-            if (
-                !other.left &&
-                other.socket != client.socket &&
-                !other.folded &&
-                other.chips > 0
-            )
-                other.acted = false;
-        }
-        player->acted = true;
+        pokerActed(game, client.socket) = true;
+        pokerActed(game, opponent) = pokerChips(game, opponent) == 0;
 
         sendPokerNotice(
             game,
@@ -9076,14 +7940,25 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        PokerGame::Player* player = pokerPlayer(game, client.socket);
-        if (!player)
-            return;
+        Socket winner = otherPokerPlayer(game, client.socket);
+        int won = game.pot;
 
-        player->folded = true;
-        player->acted = true;
-        sendPokerNotice(game, client.name + " folds.");
-        finishPokerAction(game, client.socket);
+        pokerChips(game, winner) += game.pot;
+        game.pot = 0;
+        game.handActive = false;
+        game.turn = INVALID_SOCK;
+        game.stage = PokerStage::SHOWDOWN;
+
+        sendPokerState(game);
+        sendPokerResult(
+            game,
+            client.name +
+            " folds. " +
+            getName(winner) +
+            " wins " +
+            to_string(won) +
+            " chips."
+        );
     }
 
     else if (command == "/pokernext") {
@@ -9101,49 +7976,34 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        if (fundedPokerPlayers(game) < 2) {
-            Socket winner = INVALID_SOCK;
-            for (const PokerGame::Player& player : game.players)
-                if (!player.left && player.chips > 0)
-                    winner = player.socket;
+        if (game.player1Chips <= 0 || game.player2Chips <= 0) {
+            Socket winner =
+                game.player1Chips > game.player2Chips
+                ? game.player1
+                : game.player2;
 
             string result =
-                (winner == INVALID_SOCK ? string("Poker match ended") : getName(winner) + " wins the Poker match") +
-                "!";
+                getName(winner) +
+                " wins the Poker match!";
 
-            endPokerMatch(gameIndex, result);
+            sendPacket(game.player1, "POKER_END", result);
+            sendPacket(game.player2, "POKER_END", result);
+            sendReady(game.player1);
+            sendReady(game.player2);
+
+            pokerGames.erase(
+                pokerGames.begin() + gameIndex
+            );
+
             return;
         }
 
-        game.dealer = nextPokerPlayer(game, game.dealer, true, false);
+        game.dealer = otherPokerPlayer(
+            game,
+            game.dealer
+        );
 
         startPokerHand(game);
-    }
-
-    else if (command == "/pokerend") {
-        int gameIndex = findPokerGame(client.socket);
-
-        if (gameIndex == -1) {
-            sendPacket(client.socket, "ERR", "You are not in a Poker game.");
-            return;
-        }
-
-        PokerGame& game = pokerGames[gameIndex];
-
-        if (game.host != client.socket) {
-            sendPacket(client.socket, "ERR", "Only the host can end the Poker match.");
-            return;
-        }
-
-        if (game.handActive || game.phase != "RESULT") {
-            sendPacket(client.socket, "ERR", "The Poker match can only be ended between hands.");
-            return;
-        }
-
-        endPokerMatch(
-            gameIndex,
-            client.name + " ended the Poker match."
-        );
     }
 
 
@@ -9152,44 +8012,6 @@ void handleCommand(Client& client, const string& line) {
     // --------------------------------------------------------
 
     else if (command == "/resign") {
-        int ticTacToeIndex = findTicTacToeGame(
-            client.socket
-        );
-
-        if (ticTacToeIndex != -1) {
-            TicTacToeGame& game =
-                ticTacToeGames[ticTacToeIndex];
-
-            Socket opponent =
-                game.playerX == client.socket
-                ? game.playerO
-                : game.playerX;
-
-            Socket playerX = game.playerX;
-            Socket playerO = game.playerO;
-
-            sendTicTacToeLine(
-                game,
-                client.name +
-                " resigned."
-            );
-
-            sendTicTacToeLine(
-                game,
-                getName(opponent) +
-                " wins!"
-            );
-
-            sendReady(playerX);
-            sendReady(playerO);
-
-            ticTacToeGames.erase(
-                ticTacToeGames.begin() + ticTacToeIndex
-            );
-
-            return;
-        }
-
         int chessIndex = findChessGame(
             client.socket
         );
@@ -9197,19 +8019,13 @@ void handleCommand(Client& client, const string& line) {
         if (chessIndex != -1) {
             ChessGame& game = chessGames[chessIndex];
 
-            if (!chessIsPlayer(game, client.socket)) {
-                sendPacket(
-                    client.socket,
-                    "CHESS_ERROR",
-                    "Spectators cannot resign from a Chess game."
-                );
-                return;
-            }
-
             Socket opponent =
                 game.white == client.socket
                 ? game.black
                 : game.white;
+
+            Socket white = game.white;
+            Socket black = game.black;
 
             sendChessLine(
                 game,
@@ -9223,7 +8039,8 @@ void handleCommand(Client& client, const string& line) {
                 " wins by resignation."
             );
 
-            readyChessPlayers(game);
+            sendReady(white);
+            sendReady(black);
 
             chessGames.erase(
                 chessGames.begin() + chessIndex
@@ -9306,16 +8123,14 @@ void handleCommand(Client& client, const string& line) {
             // Lobby close/leave.
             if (game.phase == "LOBBY") {
                 if (game.host == client.socket) {
-                    for (const PokerGame::Player& player : game.players) {
-                        if (player.socket == client.socket)
-                            continue;
+                    if (game.player2 != INVALID_SOCK) {
                         sendPacket(
-                            player.socket,
+                            game.player2,
                             "POKER_END",
                             client.name +
                             " closed the Poker table."
                         );
-                        sendReady(player.socket);
+                        sendReady(game.player2);
                     }
 
                     sendPacket(
@@ -9332,10 +8147,10 @@ void handleCommand(Client& client, const string& line) {
                     return;
                 }
 
-                // A guest can leave without closing the host's lobby.
-                int playerIndex = pokerPlayerIndex(game, client.socket);
-                if (playerIndex >= 0)
-                    game.players.erase(game.players.begin() + playerIndex);
+                // Guest leaves: keep host's lobby alive.
+                game.player2 = INVALID_SOCK;
+                game.player2Chips =
+                    game.startingChips;
                 game.status =
                     client.name +
                     " left the Poker table.";
@@ -9351,12 +8166,38 @@ void handleCommand(Client& client, const string& line) {
                 return;
             }
 
-            removePokerPlayerFromMatch(
-                pokerIndex,
-                client.socket,
-                client.name,
-                true
+            Socket opponent =
+                otherPokerPlayer(
+                    game,
+                    client.socket
+                );
+
+            string result =
+                client.name +
+                " resigned from Poker. " +
+                getName(opponent) +
+                " wins the match.";
+
+            sendPacket(
+                game.player1,
+                "POKER_END",
+                result
             );
+
+            sendPacket(
+                game.player2,
+                "POKER_END",
+                result
+            );
+
+            sendReady(game.player1);
+            sendReady(game.player2);
+
+            pokerGames.erase(
+                pokerGames.begin() +
+                pokerIndex
+            );
+
             return;
         }
 
@@ -9377,12 +8218,6 @@ void handleCommand(Client& client, const string& line) {
         sendPacket(client.socket, "SYS", "CHAT");
         sendPacket(client.socket, "SYS", "/users");
         sendPacket(client.socket, "SYS", "/quit");
-        sendPacket(client.socket, "SYS", "");
-        sendPacket(client.socket, "SYS", "TIC-TAC-TOE");
-        sendPacket(client.socket, "SYS", "/ttt <username>");
-        sendPacket(client.socket, "SYS", "/move <1-9>");
-        sendPacket(client.socket, "SYS", "/board");
-        sendPacket(client.socket, "SYS", "/resign");
         sendPacket(client.socket, "SYS", "");
         sendPacket(client.socket, "SYS", "CHESS");
         sendPacket(client.socket, "SYS", "/chess <username>");
@@ -9409,7 +8244,6 @@ void handleCommand(Client& client, const string& line) {
         sendPacket(client.socket, "SYS", "/pokerraise <total_bet>");
         sendPacket(client.socket, "SYS", "/pokerfold");
         sendPacket(client.socket, "SYS", "/pokernext");
-        sendPacket(client.socket, "SYS", "/pokerend");
         sendPacket(client.socket, "SYS", "/resign");
         sendPacket(client.socket, "SYS", "");
         sendPacket(client.socket, "SYS", "CHALLENGES");
@@ -9480,60 +8314,28 @@ void disconnectClient(int index) {
         }
     }
 
-    int ticTacToeIndex = findTicTacToeGame(socket);
+    int chessIndex = findChessGame(socket);
 
-    if (ticTacToeIndex != -1) {
-        TicTacToeGame game =
-            ticTacToeGames[ticTacToeIndex];
+    if (chessIndex != -1) {
+        ChessGame game = chessGames[chessIndex];
 
         Socket opponent =
-            game.playerX == socket
-            ? game.playerO
-            : game.playerX;
+            game.white == socket
+            ? game.black
+            : game.white;
 
         sendPacket(
             opponent,
-            "GAME",
+            "CHESS_END",
             name +
-            " disconnected. Tic-Tac-Toe ended."
+            " disconnected. Chess game ended."
         );
 
         sendReady(opponent);
 
-        ticTacToeGames.erase(
-            ticTacToeGames.begin() + ticTacToeIndex
+        chessGames.erase(
+            chessGames.begin() + chessIndex
         );
-    }
-
-    int chessIndex = findChessGame(socket);
-
-    if (chessIndex != -1) {
-        ChessGame& game = chessGames[chessIndex];
-
-        if (chessIsSpectator(game, socket)) {
-            game.spectators.erase(
-                remove(
-                    game.spectators.begin(),
-                    game.spectators.end(),
-                    socket
-                ),
-                game.spectators.end()
-            );
-            sendChessState(game);
-            readyChessPlayers(game);
-        }
-        else {
-            sendChessEnd(
-                game,
-                name +
-                " disconnected. Chess game ended."
-            );
-            readyChessPlayers(game);
-
-            chessGames.erase(
-                chessGames.begin() + chessIndex
-            );
-        }
     }
 
     int blackjackIndex = findBlackjackGame(socket);
@@ -9669,16 +8471,14 @@ void disconnectClient(int index) {
 
         if (game.phase == "LOBBY") {
             if (game.host == socket) {
-                for (const PokerGame::Player& player : game.players) {
-                    if (player.socket == socket)
-                        continue;
+                if (game.player2 != INVALID_SOCK) {
                     sendPacket(
-                        player.socket,
+                        game.player2,
                         "POKER_END",
                         name +
                         " disconnected. Poker table closed."
                     );
-                    sendReady(player.socket);
+                    sendReady(game.player2);
                 }
 
                 pokerGames.erase(
@@ -9687,9 +8487,11 @@ void disconnectClient(int index) {
                 );
             }
             else {
-                int playerIndex = pokerPlayerIndex(game, socket);
-                if (playerIndex >= 0)
-                    game.players.erase(game.players.begin() + playerIndex);
+                game.player2 =
+                    INVALID_SOCK;
+
+                game.player2Chips =
+                    game.startingChips;
 
                 game.status =
                     name +
@@ -9699,11 +8501,29 @@ void disconnectClient(int index) {
             }
         }
         else {
-            removePokerPlayerFromMatch(
-                pokerIndex,
-                socket,
-                name,
-                false
+            PokerGame gameCopy =
+                game;
+
+            Socket opponent =
+                otherPokerPlayer(
+                    gameCopy,
+                    socket
+                );
+
+            string result =
+                name +
+                " disconnected. Poker match ended.";
+
+            sendPacket(
+                opponent,
+                "POKER_END",
+                result
+            );
+            sendReady(opponent);
+
+            pokerGames.erase(
+                pokerGames.begin() +
+                pokerIndex
             );
         }
     }
@@ -9825,6 +8645,8 @@ void disconnectClient(int index) {
         }
     }
 
+    if (clients[index].tls) SSL_free(clients[index].tls);
+    OPENSSL_cleanse(clients[index].inputBuffer.data(), clients[index].inputBuffer.size());
     CLOSE_SOCKET(socket);
 
     clients.erase(
@@ -9849,235 +8671,206 @@ void disconnectClient(int index) {
 // MAIN
 // ============================================================
 
-int main() {
-    if (!initializeSocketLibrary()) {
-        cout << "Socket initialization failed.\n";
+
+namespace {
+    bool makeNonblocking(Socket socket) {
+#ifdef _WIN32
+        u_long one = 1;
+        return ioctlsocket(socket, FIONBIO, &one) == 0;
+#else
+        int flags = fcntl(socket, F_GETFL, 0);
+        return flags >= 0 && fcntl(socket, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+    }
+    bool tlsRetry(SSL* ssl, int result) {
+        int error = SSL_get_error(ssl, result);
+        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
+    }
+    struct Limit { int count = 0; chrono::steady_clock::time_point start = chrono::steady_clock::now(); };
+    map<string, Limit> authLimits;
+    bool allowAuth(const string& key, int maximum) {
+        auto now = chrono::steady_clock::now();
+        auto& limit = authLimits[key];
+        if (now - limit.start >= chrono::minutes(1)) limit = {0, now};
+        return ++limit.count <= maximum;
+    }
+    void authenticate(Client& c, string& line, Accounts& accounts) {
+        if (c.auth.valid()) return;
+        // Hex encoding avoids protocol delimiters in passwords; TLS supplies confidentiality.
+        auto first = line.find('|');
+        auto second = first == string::npos ? string::npos : line.find('|', first + 1);
+        string operation = line.substr(0, first);
+        if (second == string::npos || (operation != "AUTH_LOGIN" && operation != "AUTH_REGISTER")) {
+            sendPacket(c.socket, "AUTH_ERROR", "Please sign in with an updated JengChat client.");
+            return;
+        }
+        string name = line.substr(first + 1, second - first - 1);
+        if (!ValidAccountName(name)) {
+            sendPacket(c.socket, "AUTH_ERROR", "Username: 3-16 letters, numbers, underscores or hyphens.");
+            return;
+        }
+        if (!allowAuth("ip:" + c.peerIP, 20) || !allowAuth("user:" + lowerCopy(name), 6)) {
+            sendPacket(c.socket, "AUTH_ERROR", "Too many attempts. Wait one minute and retry.");
+            return;
+        }
+        string encoded = line.substr(second + 1), password;
+        auto nibble = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            return -1;
+        };
+        bool valid = encoded.size() >= 24 && encoded.size() <= 256 && encoded.size() % 2 == 0;
+        if (valid) for (size_t i = 0; i < encoded.size(); i += 2) {
+            int a = nibble(encoded[i]), b = nibble(encoded[i + 1]);
+            if (a < 0 || b < 0) { valid = false; break; }
+            password.push_back((char)(a * 16 + b));
+        }
+        OPENSSL_cleanse(encoded.data(), encoded.size());
+        if (!valid || !ValidAccountPassword(password)) {
+            OPENSSL_cleanse(password.data(), password.size());
+            sendPacket(c.socket, "AUTH_ERROR", "Password must be 12-128 printable characters.");
+            return;
+        }
+        c.auth = accounts.submit(operation == "AUTH_REGISTER", name, std::move(password));
+    }
+}
+
+int main(int argc, char** argv) {
+    if (argc != 4) {
+        cerr << "Usage: ./jengchat_server server.crt server.key accounts.sqlite3\n";
         return 1;
     }
-
-    Socket serverSocket = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
-
-    if (serverSocket == INVALID_SOCK) {
-        cout << "Could not create server socket.\n";
-        cleanupSocketLibrary();
-        return 1;
+#ifndef _WIN32
+    umask(0077);
+#endif
+    if (!initializeSocketLibrary()) return 1;
+    unique_ptr<Accounts> accounts;
+    try { accounts.reset(new Accounts(argv[3])); }
+    catch (const exception& error) { cerr << error.what() << "\n"; return 1; }
+    SSL_CTX* context = SSL_CTX_new(TLS_server_method());
+    if (!context) return 1;
+    SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
+    SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
+    if (SSL_CTX_use_certificate_chain_file(context, argv[1]) != 1 ||
+        SSL_CTX_use_PrivateKey_file(context, argv[2], SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(context) != 1) {
+        cerr << "Cannot load server certificate/private key.\n";
+        SSL_CTX_free(context); return 1;
     }
-
+    Socket listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener == INVALID_SOCK) { SSL_CTX_free(context); return 1; }
+    int reuse = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(PORT);
     address.sin_addr.s_addr = INADDR_ANY;
-
-    if (
-        bind(
-            serverSocket,
-            (sockaddr*)&address,
-            sizeof(address)
-        ) == SOCKET_ERR
-    ) {
-        cout << "Bind failed.\n";
-        CLOSE_SOCKET(serverSocket);
-        cleanupSocketLibrary();
-        return 1;
+    if (!makeNonblocking(listener) || bind(listener, (sockaddr*)&address, sizeof(address)) == SOCKET_ERR ||
+        listen(listener, SOMAXCONN) == SOCKET_ERR) {
+        cerr << "Cannot listen on port " << PORT << ". Stop the old server first.\n";
+        CLOSE_SOCKET(listener); SSL_CTX_free(context); return 1;
     }
-
-    if (
-        listen(
-            serverSocket,
-            SOMAXCONN
-        ) == SOCKET_ERR
-    ) {
-        cout << "Listen failed.\n";
-        CLOSE_SOCKET(serverSocket);
-        cleanupSocketLibrary();
-        return 1;
-    }
-
-    cout << "================================\n";
-    cout << "        JENG CHAT SERVER\n";
-    cout << "================================\n";
-    cout << "Port: " << PORT << "\n";
-    cout << "Games: Tic-Tac-Toe + Blackjack + Chess + Poker + Roulette + JENG Arena\n";
-    cout << "Waiting for players...\n\n";
-
+    cout << "JENG CHAT: TLS + accounts on TCP " << PORT << "\n";
+    auto lastCleanup = chrono::steady_clock::now();
     while (true) {
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        FD_SET(serverSocket, &readSet);
-
-        Socket maxSocket = serverSocket;
-
-        for (Client& c : clients) {
-            FD_SET(
-                c.socket,
-                &readSet
-            );
-
-            if (c.socket > maxSocket)
-                maxSocket = c.socket;
+        auto now = chrono::steady_clock::now();
+        if (now - lastCleanup > chrono::minutes(1)) {
+            for (auto it = authLimits.begin(); it != authLimits.end();)
+                if (now - it->second.start > chrono::minutes(2)) it = authLimits.erase(it); else ++it;
+            lastCleanup = now;
         }
-
-#ifdef _WIN32
-        int nfds = 0; // Ignored by Winsock.
-#else
-        int nfds = maxSocket + 1;
-#endif
-
-        timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 16000; // ~16 ms timer tick for realtime Arena sync
-
-        if (
-            select(
-                nfds,
-                &readSet,
-                nullptr,
-                nullptr,
-                &timeout
-            ) == SOCKET_ERR
-        ) {
-            break;
+        // All socket/TLS calls are nonblocking. Password work runs on a bounded worker queue.
+        sockaddr_in peer{};
+        socklen_t peerSize = sizeof(peer);
+        Socket incoming = accept(listener, (sockaddr*)&peer, &peerSize);
+        if (incoming != INVALID_SOCK) {
+            string ip = inet_ntoa(peer.sin_addr);
+            int sameIP = 0;
+            for (const auto& c : clients) if (c.peerIP == ip) ++sameIP;
+            if (clients.size() >= 128 || sameIP >= 12 || !makeNonblocking(incoming)) CLOSE_SOCKET(incoming);
+            else {
+                int noDelay = 1;
+                setsockopt(incoming, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
+                Client c; c.socket = incoming; c.peerIP = ip;
+                c.tls = SSL_new(context);
+                if (!c.tls || SSL_set_fd(c.tls, (int)incoming) != 1) {
+                    if (c.tls) SSL_free(c.tls);
+                    CLOSE_SOCKET(incoming);
+                } else {
+                    SSL_set_accept_state(c.tls);
+                    clients.push_back(std::move(c));
+                }
+            }
         }
-
-        // Handle delayed Blackjack deals even when no socket traffic
-        // arrives during this loop iteration.
         processBlackjackDealTimers();
         processArenaRealtimeTick();
-
-        // New connection.
-        if (FD_ISSET(serverSocket, &readSet)) {
-            Socket newClient = accept(
-                serverSocket,
-                nullptr,
-                nullptr
-            );
-
-            if (newClient != INVALID_SOCK) {
-                Client c;
-                c.socket = newClient;
-
-                clients.push_back(c);
-
-                cout << "New connection received.\n";
-            }
-        }
-
-        // Existing clients.
         for (int i = 0; i < (int)clients.size();) {
-            if (!FD_ISSET(clients[i].socket, &readSet)) {
-                i++;
-                continue;
+            Client& c = clients[i];
+            bool expired = !c.tlsReady ? now - c.connectedAt > chrono::seconds(10)
+                : c.name.empty() && now - c.connectedAt > chrono::seconds(60);
+            if (c.closeRequested || expired) { disconnectClient(i); continue; }
+            if (!c.tlsReady) {
+                ERR_clear_error();
+                int result = SSL_accept(c.tls);
+                if (result == 1) c.tlsReady = true;
+                else if (!tlsRetry(c.tls, result)) c.closeRequested = true;
+                ++i; continue;
             }
-
-            char buffer[BUFFER_SIZE];
-
-            int received = recv(
-                clients[i].socket,
-                buffer,
-                BUFFER_SIZE,
-                0
-            );
-
-            if (received <= 0) {
-                disconnectClient(i);
-                continue;
-            }
-
-            clients[i].inputBuffer.append(
-                buffer,
-                received
-            );
-
-            while (true) {
-                size_t newline =
-                    clients[i]
-                    .inputBuffer
-                    .find('\n');
-
-                if (newline == string::npos)
-                    break;
-
-                string line =
-                    clients[i]
-                    .inputBuffer
-                    .substr(
-                        0,
-                        newline
-                    );
-
-                clients[i]
-                .inputBuffer
-                .erase(
-                    0,
-                    newline + 1
-                );
-
-                if (
-                    !line.empty() &&
-                    line.back() == '\r'
-                ) {
-                    line.pop_back();
+            if (c.auth.valid() && c.auth.wait_for(chrono::seconds(0)) == future_status::ready) {
+                auto result = c.auth.get(); c.auth = {};
+                if (result.ok && getClientByName(result.username)) {
+                    result.ok = false; result.message = "This account is already signed in.";
                 }
-
-                // First line from a connection is the username.
-                if (clients[i].name.empty()) {
-                    clients[i].name = line;
-
-                    cout
-                        << line
-                        << " connected.\n";
-
-                    sendPacket(
-                        clients[i].socket,
-                        "SYS",
-                        "*** Welcome to JENG CHAT, " +
-                        line +
-                        "! ***"
-                    );
-
-                    sendPacket(
-                        clients[i].socket,
-                        "SYS",
-                        "Type /help for commands."
-                    );
-
-                    broadcastSystem(
-                        "*** " +
-                        line +
-                        " joined the chat ***"
-                    );
-
-                    continue;
-                }
-
-                handleCommand(
-                    clients[i],
-                    line
-                );
-
-                // The sender can type again after the response.
-                // Some game helpers also READY both players;
-                // duplicate READY packets are harmless because
-                // the client suppresses duplicate prompts.
-                sendReady(
-                    clients[i].socket
-                );
+                if (result.ok) {
+                    c.name = result.username;
+                    sendPacket(c.socket, "AUTH_OK", c.name);
+                    sendPacket(c.socket, "SYS", "Welcome to JENG CHAT, " + c.name + "!");
+                    broadcastSystem(c.name + " joined the chat.");
+                } else sendPacket(c.socket, "AUTH_ERROR", result.message);
             }
-
-            i++;
+            // A pending SSL_write retries the identical bytes before another TLS operation.
+            bool writePending = false;
+            for (int budget = 0; budget < 32 && !c.output.empty(); ++budget) {
+                const auto& message = c.output.front();
+                ERR_clear_error();
+                int sent = SSL_write(c.tls, message.data(), (int)message.size());
+                if (sent <= 0) {
+                    if (!tlsRetry(c.tls, sent)) c.closeRequested = true;
+                    writePending = true; break;
+                }
+                c.outputBytes -= message.size(); c.output.pop_front();
+            }
+            if (!writePending && !c.closeRequested) {
+                char buffer[4096];
+                for (int budget = 0; budget < 8; ++budget) {
+                    ERR_clear_error();
+                    int received = SSL_read(c.tls, buffer, sizeof(buffer));
+                    if (received <= 0) {
+                        if (!tlsRetry(c.tls, received)) c.closeRequested = true;
+                        break;
+                    }
+                    c.inputBuffer.append(buffer, received);
+                    OPENSSL_cleanse(buffer, sizeof(buffer));
+                    if (c.inputBuffer.size() > 16384) { c.closeRequested = true; break; }
+                }
+            }
+            int lines = 0;
+            while (!c.closeRequested && lines++ < 32) {
+                size_t end = c.inputBuffer.find('\n');
+                if (end == string::npos) break;
+                if (end > 4096) { c.closeRequested = true; break; }
+                string line = c.inputBuffer.substr(0, end);
+                OPENSSL_cleanse(c.inputBuffer.data(), end);
+                c.inputBuffer.erase(0, end + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (c.name.empty()) authenticate(c, line, *accounts);
+                else { handleCommand(c, line); sendReady(c.socket); }
+                OPENSSL_cleanse(line.data(), line.size());
+            }
+            if (c.closeRequested) { disconnectClient(i); continue; }
+            ++i;
         }
+        this_thread::sleep_for(chrono::milliseconds(4));
     }
-
-    for (Client& c : clients) {
-        CLOSE_SOCKET(c.socket);
-    }
-
-    CLOSE_SOCKET(serverSocket);
-    cleanupSocketLibrary();
-
-    return 0;
 }

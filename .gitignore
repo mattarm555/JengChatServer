@@ -1,0 +1,7 @@
+server.key
+*.key
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+jengchat_server

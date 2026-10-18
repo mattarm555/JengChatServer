@@ -1590,7 +1590,10 @@ void playChessMove(
         sendPacket(
             client.socket,
             "CHESS_ERROR",
-            "Illegal Chess move."
+            (engineMove ? "Engine debug: illegal engine move " :
+                "Illegal Chess move ") +
+            fromText + "-" + toText +
+            " for " + (white ? "White" : "Black") + "."
         );
         return;
     }
@@ -5776,9 +5779,15 @@ void handleCommand(Client& client, const string& line) {
         ChessGame& game = chessGames[chessIndex];
         if (!game.engineGame || game.turn != INVALID_SOCK) {
             sendPacket(client.socket, "CHESS_ERROR",
-                "It is not JengEngine's turn.");
+                "Engine debug: server rejected move; engineGame=" +
+                to_string(game.engineGame ? 1 : 0) +
+                ", turn=" + to_string((long long)game.turn) + ".");
             return;
         }
+        sendPacket(client.socket, "CHESS_NOTICE",
+            "Engine debug: received " + fields[0] + "-" + fields[1] +
+            ", engine color=" +
+            (game.engineWhite ? "WHITE" : "BLACK") + ".");
         Client engineClient = client;
         engineClient.name = "JengEngine L" + to_string(game.engineLevel);
         playChessMove(

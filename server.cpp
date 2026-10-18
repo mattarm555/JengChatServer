@@ -212,6 +212,11 @@ struct ChessGame {
     Socket white;
     Socket black;
     Socket turn;
+    bool engineGame = false;
+    int engineLevel = 0;
+    bool engineWhite = false;
+    vector<Socket> spectators;
+    vector<string> moveHistory;
 
     // Uppercase pieces are White, lowercase pieces are Black.
     // Rows: 0 = rank 8, 7 = rank 1.
@@ -518,7 +523,12 @@ int findChessGame(Socket socket) {
     for (int i = 0; i < (int)chessGames.size(); i++) {
         if (
             chessGames[i].white == socket ||
-            chessGames[i].black == socket
+            chessGames[i].black == socket ||
+            find(
+                chessGames[i].spectators.begin(),
+                chessGames[i].spectators.end(),
+                socket
+            ) != chessGames[i].spectators.end()
         ) {
             return i;
         }
@@ -648,8 +658,27 @@ void sendChessLine(
 ) {
     // Chess UI/status packets are intentionally separate from GAME
     // so the graphical client does not print Chess into chat.
-    sendPacket(game.white, "CHESS_NOTICE", text);
-    sendPacket(game.black, "CHESS_NOTICE", text);
+    if (game.white != INVALID_SOCK)
+        sendPacket(game.white, "CHESS_NOTICE", text);
+    if (game.black != INVALID_SOCK)
+        sendPacket(game.black, "CHESS_NOTICE", text);
+    for (Socket spectator : game.spectators)
+        sendPacket(spectator, "CHESS_NOTICE", text);
+}
+
+void sendChessMoveRecord(
+    ChessGame& game,
+    const string& from,
+    const string& to,
+    char promotion
+) {
+    string data = from + "|" + to + "|" + string(1, promotion);
+    if (game.white != INVALID_SOCK)
+        sendPacket(game.white, "CHESS_MOVE_RECORD", data);
+    if (game.black != INVALID_SOCK)
+        sendPacket(game.black, "CHESS_MOVE_RECORD", data);
+    for (Socket spectator : game.spectators)
+        sendPacket(spectator, "CHESS_MOVE_RECORD", data);
 }
 
 string encodeChessBoard(const ChessGame& game) {
@@ -661,46 +690,94 @@ string encodeChessBoard(const ChessGame& game) {
             char piece = game.board[row][col];
             encoded += piece == ' ' ? '.' : piece;
         }
+
     }
 
     return encoded;
+}
+
+string encodeChessCastling(const ChessGame& game) {
+    string rights;
+    if (!game.whiteKingMoved && !game.whiteHRookMoved) rights += "K";
+    if (!game.whiteKingMoved && !game.whiteARookMoved) rights += "Q";
+    if (!game.blackKingMoved && !game.blackHRookMoved) rights += "k";
+    if (!game.blackKingMoved && !game.blackARookMoved) rights += "q";
+    return rights.empty() ? "-" : rights;
+}
+
+string encodeChessEnPassant(const ChessGame& game) {
+    if (game.enPassantRow < 0 || game.enPassantCol < 0)
+        return "-";
+    return chessSquareName(game.enPassantRow, game.enPassantCol);
 }
 
 void sendChessStateTo(
     ChessGame& game,
     Socket socket
 ) {
-    string yourColor =
-        socket == game.white
-        ? "WHITE"
-        : "BLACK";
+    const string whiteName = game.engineGame && game.engineWhite
+        ? "JengEngine L" + to_string(game.engineLevel)
+        : getName(game.white);
+    const string blackName = game.engineGame && !game.engineWhite
+        ? "JengEngine L" + to_string(game.engineLevel)
+        : getName(game.black);
+    string yourColor = "SPECTATOR";
+    if (socket == game.white)
+        yourColor = "WHITE";
+    else if (socket == game.black)
+        yourColor = "BLACK";
 
     string data =
         encodeChessBoard(game) + "|" +
-        getName(game.white) + "|" +
-        getName(game.black) + "|" +
-        getName(game.turn) + "|" +
-        yourColor;
+        whiteName + "|" +
+        blackName + "|" +
+        (game.engineGame && game.turn == INVALID_SOCK
+             ? (game.engineWhite ? whiteName : blackName)
+             : getName(game.turn)) + "|" +
+        yourColor + "|" +
+        (game.engineGame ? "ENGINE" : "HUMAN") + "|" +
+        to_string(game.engineLevel) + "|" +
+        (game.engineGame ? (game.engineWhite ? "WHITE" : "BLACK") : "-") + "|" +
+        encodeChessCastling(game) + "|" +
+        encodeChessEnPassant(game) + "|" +
+        to_string(game.spectators.size());
+
+    for (Socket spectator : game.spectators)
+    {
+        data += "|" + getName(spectator);
+    }
 
     sendPacket(socket, "CHESS_STATE", data);
 }
 
 void sendChessState(ChessGame& game) {
-    sendChessStateTo(game, game.white);
-    sendChessStateTo(game, game.black);
+    if (game.white != INVALID_SOCK)
+        sendChessStateTo(game, game.white);
+    if (game.black != INVALID_SOCK)
+        sendChessStateTo(game, game.black);
+    for (Socket spectator : game.spectators)
+        sendChessStateTo(game, spectator);
 }
 
 void sendChessEnd(
     ChessGame& game,
     const string& text
 ) {
-    sendPacket(game.white, "CHESS_END", text);
-    sendPacket(game.black, "CHESS_END", text);
+    if (game.white != INVALID_SOCK)
+        sendPacket(game.white, "CHESS_END", text);
+    if (game.black != INVALID_SOCK)
+        sendPacket(game.black, "CHESS_END", text);
+    for (Socket spectator : game.spectators)
+        sendPacket(spectator, "CHESS_END", text);
 }
 
 void readyChessPlayers(ChessGame& game) {
-    sendReady(game.white);
-    sendReady(game.black);
+    if (game.white != INVALID_SOCK)
+        sendReady(game.white);
+    if (game.black != INVALID_SOCK)
+        sendReady(game.black);
+    for (Socket spectator : game.spectators)
+        sendReady(spectator);
 }
 
 ChessGame makeChessGame(
@@ -730,6 +807,22 @@ ChessGame makeChessGame(
         game.board[7][col] = whiteBack[col];
     }
 
+    return game;
+}
+
+ChessGame makeChessEngineGame(
+    Socket player,
+    int level,
+    bool engineWhite
+) {
+    ChessGame game = makeChessGame(
+        engineWhite ? INVALID_SOCK : player,
+        engineWhite ? player : INVALID_SOCK
+    );
+    game.engineGame = true;
+    game.engineLevel = max(1, min(6, level));
+    game.engineWhite = engineWhite;
+    game.turn = engineWhite ? INVALID_SOCK : player;
     return game;
 }
 
@@ -1405,7 +1498,8 @@ void playChessMove(
     Client& client,
     const string& fromText,
     const string& toText,
-    const string& promotionText
+    const string& promotionText,
+    bool engineMove = false
 ) {
     if (
         gameIndex < 0 ||
@@ -1421,7 +1515,8 @@ void playChessMove(
 
     ChessGame& game = chessGames[gameIndex];
 
-    if (game.turn != client.socket) {
+    if ((!engineMove && game.turn != client.socket) ||
+        (engineMove && (!game.engineGame || game.turn != INVALID_SOCK))) {
         sendPacket(
             client.socket,
             "CHESS_ERROR",
@@ -1444,7 +1539,7 @@ void playChessMove(
         return;
     }
 
-    bool white = client.socket == game.white;
+    bool white = engineMove ? game.engineWhite : client.socket == game.white;
     char promotion = 'q';
 
     if (!promotionText.empty()) {
@@ -1495,6 +1590,13 @@ void playChessMove(
         promotion
     );
 
+    sendChessMoveRecord(
+        game,
+        chessSquareName(fromRow, fromCol),
+        chessSquareName(toRow, toCol),
+        promotion
+    );
+
     sendChessLine(
         game,
         client.name +
@@ -1505,10 +1607,10 @@ void playChessMove(
         "."
     );
 
-    game.turn =
-        game.turn == game.white
-        ? game.black
-        : game.white;
+    if (game.engineGame)
+        game.turn = engineMove ? game.white : INVALID_SOCK;
+    else
+        game.turn = game.turn == game.white ? game.black : game.white;
 
     bool nextWhite = game.turn == game.white;
     bool nextInCheck = chessInCheck(game, nextWhite);
@@ -1535,8 +1637,8 @@ void playChessMove(
             );
         }
 
-        sendReady(whiteSocket);
-        sendReady(blackSocket);
+        if (whiteSocket != INVALID_SOCK) sendReady(whiteSocket);
+        if (blackSocket != INVALID_SOCK) sendReady(blackSocket);
 
         chessGames.erase(
             chessGames.begin() + gameIndex
@@ -5548,6 +5650,131 @@ void handleCommand(Client& client, const string& line) {
     }
 
     // --------------------------------------------------------
+    // Start a client-side JengEngine game.
+    // CHESS_ENGINE|1..6
+    // --------------------------------------------------------
+    if (line.rfind("CHESS_ENGINE|", 0) == 0) {
+        if (isPlayerBusy(client.socket)) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                "You are already in a game.");
+            return;
+        }
+
+        int level = 1;
+        try { level = stoi(line.substr(13)); } catch (...) {}
+        level = max(1, min(6, level));
+        bool engineWhite = (rng() % 2) == 0;
+        ChessGame game = makeChessEngineGame(
+            client.socket, level, engineWhite);
+        chessGames.push_back(game);
+        ChessGame& created = chessGames.back();
+        sendChessLine(created, "JengEngine L" + to_string(level) +
+            " game started. " +
+            (engineWhite ? "JengEngine is White." : "You are White."));
+        sendChessState(created);
+        readyChessPlayers(created);
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Invite a player to spectate the current Chess game.
+    // CHESS_SPECTATE_INVITE|username
+    // --------------------------------------------------------
+    if (line.rfind("CHESS_SPECTATE_INVITE|", 0) == 0) {
+        int chessIndex = findChessGame(client.socket);
+        if (chessIndex == -1) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                "You are not in a Chess game.");
+            return;
+        }
+        ChessGame& game = chessGames[chessIndex];
+        string targetName = line.substr(22);
+        Client* target = getClientByName(targetName);
+        if (!target || target->socket == client.socket) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                "Spectator not found.");
+            return;
+        }
+
+        if (isPlayerBusy(target->socket)) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                targetName + " is already in a game.");
+            return;
+        }
+        if (target->pendingChallenge != INVALID_SOCK) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                targetName + " already has a pending challenge.");
+            return;
+        }
+        target->pendingChallenge = client.socket;
+        target->pendingGame = "chess_spectate";
+        sendPacket(client.socket, "CHESS_NOTICE",
+            "Spectator invitation sent to " + targetName + ".");
+        sendPacket(target->socket, "CHESS_SPECTATE_CHALLENGE",
+            client.name + "|" +
+            (game.engineGame && game.engineWhite
+                ? "JengEngine L" + to_string(game.engineLevel)
+                : getName(game.white)) + "|" +
+            (game.engineGame
+                ? "JengEngine L" + to_string(game.engineLevel)
+                : getName(game.black)));
+        sendReady(target->socket);
+        return;
+    }
+
+    if (workingLine == "CHESS_SPECTATE_LEAVE") {
+        int chessIndex = findChessGame(client.socket);
+        if (chessIndex == -1) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                "You are not spectating a Chess game.");
+            return;
+        }
+        ChessGame& game = chessGames[chessIndex];
+        auto it = find(game.spectators.begin(), game.spectators.end(),
+                       client.socket);
+        if (it != game.spectators.end())
+            game.spectators.erase(it);
+        sendPacket(client.socket, "CHESS_END", "Stopped spectating Chess.");
+        sendReady(client.socket);
+        sendChessState(game);
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Client-side engine move, validated and broadcast by the server.
+    // CHESS_ENGINE_MOVE|e2|e4|q
+    // --------------------------------------------------------
+    if (line.rfind("CHESS_ENGINE_MOVE|", 0) == 0) {
+        vector<string> fields;
+        string part;
+        stringstream stream(line.substr(18));
+        while (getline(stream, part, '|')) fields.push_back(part);
+        int chessIndex = findChessGame(client.socket);
+        if (chessIndex == -1 || fields.size() < 2) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                "Invalid engine move.");
+            return;
+        }
+        ChessGame& game = chessGames[chessIndex];
+        if (!game.engineGame || game.turn != INVALID_SOCK) {
+            sendPacket(client.socket, "CHESS_ERROR",
+                "It is not JengEngine's turn.");
+            return;
+        }
+        Client engineClient = client;
+        engineClient.name = "JengEngine L" + to_string(game.engineLevel);
+        playChessMove(
+            chessIndex,
+            engineClient,
+            fields[0],
+            fields[1],
+            fields.size() >= 3 ? fields[2] : "q",
+            true
+        );
+        return;
+    }
+
+    // --------------------------------------------------------
     // Graphical Chess legal-move request
     // CHESS_LEGAL|e2
     // --------------------------------------------------------
@@ -7146,6 +7373,41 @@ void handleCommand(Client& client, const string& line) {
         Socket challengerSocket = challenger->socket;
         Socket accepterSocket = client.socket;
 
+        if (gameType == "chess_spectate") {
+            int chessIndex = findChessGame(challengerSocket);
+            if (chessIndex == -1 ||
+                findChessGame(accepterSocket) != -1) {
+                clearPendingChallenge(client);
+                sendPacket(
+                    accepterSocket,
+                    "CHESS_ERROR",
+                    "That Chess game is no longer available."
+                );
+                return;
+            }
+
+            ChessGame& game = chessGames[chessIndex];
+            if (find(game.spectators.begin(), game.spectators.end(),
+                     accepterSocket) == game.spectators.end())
+                game.spectators.push_back(accepterSocket);
+
+            clearPendingChallenge(client);
+            sendChessState(game);
+            sendPacket(
+                accepterSocket,
+                "CHESS_NOTICE",
+                "You are now spectating " +
+                (game.engineGame && game.engineWhite
+                    ? "JengEngine L" + to_string(game.engineLevel)
+                    : getName(game.white)) + " vs. " +
+                (game.engineGame
+                    ? "JengEngine L" + to_string(game.engineLevel)
+                    : getName(game.black)) + "."
+            );
+            readyChessPlayers(game);
+            return;
+        }
+
         // Blackjack invitations join an existing host lobby. The host is
         // intentionally already considered busy because they own that table.
         if (gameType == "blackjack") {
@@ -8449,6 +8711,23 @@ void handleCommand(Client& client, const string& line) {
         if (chessIndex != -1) {
             ChessGame& game = chessGames[chessIndex];
 
+            auto spectator = find(
+                game.spectators.begin(),
+                game.spectators.end(),
+                client.socket
+            );
+            if (spectator != game.spectators.end()) {
+                game.spectators.erase(spectator);
+                sendPacket(
+                    client.socket,
+                    "CHESS_END",
+                    "Stopped spectating Chess."
+                );
+                sendChessState(game);
+                sendReady(client.socket);
+                return;
+            }
+
             Socket opponent =
                 game.white == client.socket
                 ? game.black
@@ -8724,7 +9003,28 @@ void disconnectClient(int index) {
     int chessIndex = findChessGame(socket);
 
     if (chessIndex != -1) {
-        ChessGame game = chessGames[chessIndex];
+        ChessGame& game = chessGames[chessIndex];
+
+        auto spectator = find(
+            game.spectators.begin(),
+            game.spectators.end(),
+            socket
+        );
+        if (spectator != game.spectators.end()) {
+            game.spectators.erase(spectator);
+            sendChessState(game);
+            return;
+        }
+
+        if (game.engineGame) {
+            sendChessEnd(
+                game,
+                name + " disconnected. Chess game ended."
+            );
+            readyChessPlayers(game);
+            chessGames.erase(chessGames.begin() + chessIndex);
+            return;
+        }
 
         Socket opponent =
             game.white == socket

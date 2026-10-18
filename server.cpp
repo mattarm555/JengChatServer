@@ -763,12 +763,26 @@ void sendChessEnd(
     ChessGame& game,
     const string& text
 ) {
+    string payload =
+        text + "|" +
+        encodeChessBoard(game) + "|" +
+        (game.engineGame && game.engineWhite
+            ? "JengEngine L" + to_string(game.engineLevel)
+            : getName(game.white)) + "|" +
+        (game.engineGame && !game.engineWhite
+            ? "JengEngine L" + to_string(game.engineLevel)
+            : getName(game.black)) + "|" +
+        (game.engineGame && game.turn == INVALID_SOCK
+            ? (game.engineWhite
+                ? "JengEngine L" + to_string(game.engineLevel)
+                : getName(game.black))
+            : getName(game.turn)) + "|";
     if (game.white != INVALID_SOCK)
-        sendPacket(game.white, "CHESS_END", text);
+        sendPacket(game.white, "CHESS_END", payload + "WHITE");
     if (game.black != INVALID_SOCK)
-        sendPacket(game.black, "CHESS_END", text);
+        sendPacket(game.black, "CHESS_END", payload + "BLACK");
     for (Socket spectator : game.spectators)
-        sendPacket(spectator, "CHESS_END", text);
+        sendPacket(spectator, "CHESS_END", payload + "SPECTATOR");
 }
 
 void readyChessPlayers(ChessGame& game) {
@@ -1599,7 +1613,9 @@ void playChessMove(
 
     sendChessLine(
         game,
-        client.name +
+        (engineMove
+            ? "JengEngine L" + to_string(game.engineLevel)
+            : client.name) +
         " moves " +
         chessSquareName(fromRow, fromCol) +
         " to " +
@@ -1608,7 +1624,9 @@ void playChessMove(
     );
 
     if (game.engineGame)
-        game.turn = engineMove ? game.white : INVALID_SOCK;
+        game.turn = engineMove
+            ? (game.engineWhite ? game.black : game.white)
+            : INVALID_SOCK;
     else
         game.turn = game.turn == game.white ? game.black : game.white;
 
@@ -8732,6 +8750,10 @@ void handleCommand(Client& client, const string& line) {
                 game.white == client.socket
                 ? game.black
                 : game.white;
+            string opponentName =
+                game.engineGame
+                ? "JengEngine L" + to_string(game.engineLevel)
+                : getName(opponent);
 
             Socket white = game.white;
             Socket black = game.black;
@@ -8744,12 +8766,12 @@ void handleCommand(Client& client, const string& line) {
 
             sendChessEnd(
                 game,
-                getName(opponent) +
+                opponentName +
                 " wins by resignation."
             );
 
-            sendReady(white);
-            sendReady(black);
+            if (white != INVALID_SOCK) sendReady(white);
+            if (black != INVALID_SOCK) sendReady(black);
 
             chessGames.erase(
                 chessGames.begin() + chessIndex

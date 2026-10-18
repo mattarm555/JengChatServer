@@ -1587,6 +1587,11 @@ void playChessMove(
             promotion
         )
     ) {
+        cerr
+            << "[JengEngine] illegal move: "
+            << fromText << "-" << toText
+            << ", color=" << (white ? "WHITE" : "BLACK")
+            << endl;
         sendPacket(
             client.socket,
             "CHESS_ERROR",
@@ -1606,6 +1611,12 @@ void playChessMove(
         toCol,
         promotion
     );
+    cerr
+        << "[Chess] applied move: "
+        << chessSquareName(fromRow, fromCol) << "-"
+        << chessSquareName(toRow, toCol)
+        << ", source=" << (engineMove ? "JengEngine" : "player")
+        << endl;
 
     sendChessMoveRecord(
         game,
@@ -5777,6 +5788,14 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
         ChessGame& game = chessGames[chessIndex];
+        cerr
+            << "[JengEngine] received move request: "
+            << (fields.size() >= 1 ? fields[0] : "?") << "-"
+            << (fields.size() >= 2 ? fields[1] : "?")
+            << ", engine_game=" << (game.engineGame ? "yes" : "no")
+            << ", turn=" << (long long)game.turn
+            << ", engine_color=" << (game.engineWhite ? "WHITE" : "BLACK")
+            << endl;
         if (!game.engineGame || game.turn != INVALID_SOCK) {
             sendPacket(client.socket, "CHESS_ERROR",
                 "Engine debug: server rejected move; engineGame=" +

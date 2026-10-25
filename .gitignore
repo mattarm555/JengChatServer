@@ -5,3 +5,8 @@ server.key
 *.db
 *.db-*
 jengchat_server
+
+# Local build and test output
+build/
+*.exe
+*.o

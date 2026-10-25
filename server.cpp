@@ -2609,6 +2609,20 @@ string encodeRouletteBets(
     return result;
 }
 
+// Roulette stakes are public table information. Send the same complete snapshot
+// to every seated player so clients can draw each player's colored markers.
+string encodeRouletteTableBets(const RouletteGame& game) {
+    string encoded;
+    for (const RoulettePlayer& player : game.players) {
+        for (const RouletteBet& bet : player.bets) {
+            if (!encoded.empty()) encoded += ";";
+            encoded += getName(player.socket) + "~" + bet.type + "~" +
+                to_string(bet.value) + "~" + to_string(bet.amount);
+        }
+    }
+    return encoded.empty() ? "-" : encoded;
+}
+
 void sendRouletteState(
     RouletteGame& game
 ) {
@@ -2627,7 +2641,13 @@ void sendRouletteState(
             encodeRoulettePlayer(player);
     }
 
+    const string tableBets = encodeRouletteTableBets(game);
     for (const RoulettePlayer& player : game.players) {
+        sendPacket(
+            player.socket,
+            "RLT_TABLE_BETS",
+            tableBets
+        );
         sendPacket(
             player.socket,
             "RLT_STATE",

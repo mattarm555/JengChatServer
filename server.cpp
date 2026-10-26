@@ -124,6 +124,12 @@ struct Client {
     bool readClosed = false;
     bool closeAfterFlush = false;
     string peerIP;
+    bool hubCapable=false;
+    string hubInviteId, hubInviteLobby, hubInviteView, hubError;
+    Socket hubInviteFrom=INVALID_SOCK;
+    chrono::steady_clock::time_point hubInviteAt{}, hubSnapshotAt{};
+    deque<pair<string,string>> hubResults;
+    deque<chrono::steady_clock::time_point> hubCommands;
     bool recoveryCapable=false;
     string sessionHash, pendingResume;
     std::chrono::steady_clock::time_point lastReceive=std::chrono::steady_clock::now();
@@ -164,7 +170,14 @@ struct BlackjackPlayer {
     vector<BlackjackHand> hands;
 };
 
-struct BlackjackGame {
+// IDs survive vector relocation and are never reused during this server process.
+uint64_t nextHubId=1;
+struct HubLobby {
+    string hubId=to_string(nextHubId++);
+    bool hubOpen=false;
+    Socket hubOwner=INVALID_SOCK;
+};
+struct BlackjackGame : HubLobby {
     Socket host = INVALID_SOCK;
     int startingChips = 0;
     int totalHands = 1;
@@ -206,7 +219,7 @@ struct RoulettePlayer {
     vector<RouletteBet> bets;
 };
 
-struct RouletteGame {
+struct RouletteGame : HubLobby {
     Socket host = INVALID_SOCK;
     int startingChips = 0;
     int totalRounds = 1;
@@ -254,7 +267,7 @@ enum class PokerStage {
     SHOWDOWN
 };
 
-struct PokerGame {
+struct PokerGame : HubLobby {
     Socket host = INVALID_SOCK;
 
     struct Player {
@@ -355,7 +368,7 @@ struct ArenaPlayer {
     chrono::steady_clock::time_point lastMineAt{};
 };
 
-struct ArenaGame {
+struct ArenaGame : HubLobby {
     Socket host = INVALID_SOCK;
     string mode = "SCORE_FFA";
     string map = "REACTOR_YARD";
@@ -423,6 +436,8 @@ void sendPacket(
     const string& type,
     const string& text
 ) {
+    if(type=="ERR" || (type.size()>=6 && type.substr(type.size()-6)=="_ERROR"))
+        for(auto& c:clients)if(c.socket==socket)c.hubError=text;
     sendAll(
         socket,
         type + "|" + text + "\n"
@@ -5146,7 +5161,7 @@ void processArenaRealtimeTick() {
 // COMMAND HANDLER
 // ============================================================
 
-void handleCommand(Client& client, const string& line) {
+void handleLegacyCommand(Client& client, const string& line) {
     if (line.empty())
         return;
 
@@ -7118,7 +7133,7 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        handleCommand(
+        handleLegacyCommand(
             client,
             "RLT_CREATE|" +
             to_string(startingChips) +
@@ -7146,7 +7161,7 @@ void handleCommand(Client& client, const string& line) {
             return;
         }
 
-        handleCommand(
+        handleLegacyCommand(
             client,
             "RLT_INVITE|" +
             targetName
@@ -9042,6 +9057,8 @@ void handleCommand(Client& client, const string& line) {
 // DISCONNECT
 // ============================================================
 
+#include "hub.h"
+
 void disconnectClient(int index) {
     Socket socket = clients[index].socket;
     string name = clients[index].name;
@@ -9540,7 +9557,7 @@ namespace {
         candidate=getClient(incoming);if(!candidate)return;
         candidate->pendingResume.clear();candidate->name=name;candidate->sessionHash=digest;
         candidate->recoveryCapable=true;candidate->lastReceive=candidate->lastPing=chrono::steady_clock::now();sessions.attach(digest);
-        sendPacket(incoming,"AUTH_OK",name);sendPacket(incoming,"SERVER_CAPS","Automatic chat reconnection available.");
+        sendPacket(incoming,"AUTH_OK",name);sendPacket(incoming,"SERVER_CAPS","Automatic chat reconnection available.");sendPacket(incoming,"HUB_CAPS","hub-v1");
         sendPacket(incoming,"SYS","Chat reconnected. Messages during the gap may have been missed. Games were not resumed.");
         broadcastSystem(name+" reconnected to chat.");
     }
@@ -9689,6 +9706,7 @@ int main(int argc, char** argv) {
         }
         processBlackjackDealTimers();
         processArenaRealtimeTick();
+        hubMaintain();
         for (int i = 0; i < (int)clients.size();) {
             Client& c = clients[i];
             bool expired = !c.tlsReady ? now - c.connectedAt > chrono::seconds(10)
@@ -9716,7 +9734,7 @@ int main(int argc, char** argv) {
                     if (result.ok) {
                         c.name = result.username;
                         sendPacket(c.socket, "AUTH_OK", c.name);
-                        sendPacket(c.socket, "SERVER_CAPS", "Automatic chat reconnection available.");
+                        sendPacket(c.socket, "SERVER_CAPS", "Automatic chat reconnection available.");sendPacket(c.socket,"HUB_CAPS","hub-v1");
                         sendPacket(c.socket, "SYS", "Welcome to JENG CHAT, " + c.name + "!");
                         broadcastSystem(c.name + " joined the chat.");
                     } else sendPacket(c.socket, "AUTH_ERROR", result.message);

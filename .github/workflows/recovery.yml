@@ -23,11 +23,13 @@ jobs:
           ./build/recovery-tests
           g++ -std=c++17 -O1 tests/roulette_broadcast.cpp accounts.cpp -o build/roulette-tests -lssl -lcrypto -lsodium -lsqlite3 -pthread
           ./build/roulette-tests
+          g++ -std=c++17 -O1 tests/hub.cpp accounts.cpp -o build/hub-tests -lssl -lcrypto -lsodium -lsqlite3 -pthread
+          ./build/hub-tests
           git rev-parse HEAD > build/staged/COMMIT.txt
           git archive --format=tar.gz --prefix=JengChatServer/ HEAD > build/staged/JengChatServer-source.tar.gz
           dpkg-query -W g++ libssl-dev libsodium-dev libsqlite3-dev > build/staged/DEPENDENCIES.txt
           ldd build/staged/jengchat_server > build/staged/RUNTIME.txt
-          cp RECOVERY_PROTOCOL.md SERVER_DEPLOYMENT.md build/staged/
+          cp RECOVERY_PROTOCOL.md SERVER_DEPLOYMENT.md HUB_PROTOCOL.md BETA4_DEPLOYMENT.md build/staged/
           cd build/staged && sha256sum * > SHA256SUMS.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

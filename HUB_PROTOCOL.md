@@ -1,6 +1,6 @@
 # Friends hub protocol v1
 
-Hub support is independent of resume-v1. After authentication/resume, the server advertises `HUB_CAPS|hub-v1`; interested clients send `HUB_HELLO|hub-v1`. Old clients retain USERS_REQUEST/USERS_LIST, all existing game commands and invitations. New clients on old servers retain the existing invitation path. No database migration or game resume is introduced.
+Hub support is independent of resume-v1. After authentication/resume, new clients probe `CLIENT_CAPS|hub-v1`; the server replies `HUB_CAPS|hub-v1`, then interested clients send `HUB_HELLO|hub-v1`. The client probes only peers advertising the existing recovery-era SERVER_CAPS message; beta 3 safely ignores unknown CLIENT_CAPS and older servers receive no probe. Hub negotiation never requires SESSION_START or resume-v1 opt-in. Old clients retain USERS_REQUEST/USERS_LIST, all existing game commands and invitations. New clients on old servers retain the existing invitation path. No database migration or game resume is introduced.
 
 ## Snapshots
 

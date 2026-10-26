@@ -9557,11 +9557,14 @@ namespace {
         candidate=getClient(incoming);if(!candidate)return;
         candidate->pendingResume.clear();candidate->name=name;candidate->sessionHash=digest;
         candidate->recoveryCapable=true;candidate->lastReceive=candidate->lastPing=chrono::steady_clock::now();sessions.attach(digest);
-        sendPacket(incoming,"AUTH_OK",name);sendPacket(incoming,"SERVER_CAPS","Automatic chat reconnection available.");sendPacket(incoming,"HUB_CAPS","hub-v1");
+        sendPacket(incoming,"AUTH_OK",name);sendPacket(incoming,"SERVER_CAPS","Automatic chat reconnection available.");
         sendPacket(incoming,"SYS","Chat reconnected. Messages during the gap may have been missed. Games were not resumed.");
         broadcastSystem(name+" reconnected to chat.");
     }
     void handleRecovery(Client& c,const string& line) {
+        // Unknown CLIENT_CAPS are safely ignored by beta 3. Only advertise hub
+        // packets to clients that probe, so legacy chat never displays wire IDs.
+        if(line=="CLIENT_CAPS|hub-v1"){sendPacket(c.socket,"HUB_CAPS","hub-v1");return;}
         if(line=="CLIENT_CAPS|resume-v1") {c.recoveryCapable=true;return;}
         if(line=="SESSION_START|" && c.recoveryCapable) {
             if(!c.sessionHash.empty())return;
@@ -9734,7 +9737,7 @@ int main(int argc, char** argv) {
                     if (result.ok) {
                         c.name = result.username;
                         sendPacket(c.socket, "AUTH_OK", c.name);
-                        sendPacket(c.socket, "SERVER_CAPS", "Automatic chat reconnection available.");sendPacket(c.socket,"HUB_CAPS","hub-v1");
+                        sendPacket(c.socket, "SERVER_CAPS", "Automatic chat reconnection available.");
                         sendPacket(c.socket, "SYS", "Welcome to JENG CHAT, " + c.name + "!");
                         broadcastSystem(c.name + " joined the chat.");
                     } else sendPacket(c.socket, "AUTH_ERROR", result.message);

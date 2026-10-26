@@ -60,6 +60,8 @@ int main(){try{
     handleCommand(*getClient(100),"HUB_INVITE_PLAYER|2|chess_spectate|Other");id=getClient(102)->hubInviteId;
     handleCommand(*getClient(102),"HUB_ACCEPT|1|"+id);require(chessGames[0].spectators.size()==1,"spectator invitation failed");
     clearOutput();hubSnapshot(*getClient(100));require(has(100,"Other|Spectating|chess")&&has(100,"Guest|Playing|chess"),"activity wrong");
+    reset();add(100,"Probe",false);handleRecovery(clients[0],"CLIENT_CAPS|hub-v1");
+    require(has(100,"HUB_CAPS|hub-v1")&&!clients[0].recoveryCapable,"hub capability coupled to session recovery");
     reset();add(100,"Legacy",false);handleCommand(clients[0],"USERS_REQUEST");require(has(100,"USERS_LIST|Legacy")&&!has(100,"HUB_PLAYER|"),"old roster changed");
     std::cout<<"PASS: all four admissions, visibility permissions/defaults, capacity races, duplicate requests, stale/expired invitations, host replacement, chess/spectators, legacy protocol\n";return 0;
 }catch(const exception& e){cerr<<e.what()<<'\n';return 1;}}

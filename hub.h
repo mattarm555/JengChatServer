@@ -26,7 +26,7 @@ void hubInvalidate(Client& c,const string& why) {
     if(c.hubCapable&&!c.hubInviteId.empty())sendPacket(c.socket,"HUB_INVALID",c.hubInviteId+"|"+why);
     if(auto* from=getClient(c.hubInviteFrom);from&&from->hubCapable)
         sendPacket(from->socket,"HUB_NOTICE","Invitation to "+c.name+": "+why);
-    if(!c.hubCapable)sendPacket(c.socket,"GAME","Challenge cancelled: "+why);
+    if(!c.hubCapable&&c.pendingChallenge!=INVALID_SOCK)sendPacket(c.socket,"GAME","Challenge cancelled: "+why);
     clearPendingChallenge(c);c.hubInviteId.clear();c.hubInviteView.clear();c.hubInviteLobby.clear();c.hubInviteFrom=INVALID_SOCK;
 }
 void hubMaintain(HubClock::time_point now=HubClock::now()) {
@@ -37,7 +37,7 @@ void hubMaintain(HubClock::time_point now=HubClock::now()) {
     }
     for(auto& c:clients) {
         if(c.pendingChallenge==INVALID_SOCK) {
-            if(!c.hubInviteId.empty())hubInvalidate(c,"Invitation closed.");
+            if(!c.hubInviteId.empty())hubInvalidate(c,isPlayerBusy(c.socket)?"Invitation accepted.":"Invitation closed.");
             continue;
         }
         auto* from=getClient(c.pendingChallenge);

@@ -52,7 +52,7 @@ int main(){try{
         hubMaintain();require(!e.meta->hubOpen,"replacement host inherited public access");
         // Legacy /accept still routes through the same admission path.
         e=setup(kind);getClient(101)->hubCapable=false;getClient(101)->pendingChallenge=100;getClient(101)->pendingGame=e.kind;
-        handleCommand(*getClient(101),"/accept");require(isPlayerBusy(101),"old client cannot accept invitation");
+        handleCommand(*getClient(101),"/accept");require(isPlayerBusy(101),"old client cannot accept invitation");require(!has(101,"Challenge cancelled:"),"accepted legacy invite reported cancelled");
     }
     reset();add(100,"Host");add(101,"Guest");add(102,"Other");
     handleCommand(*getClient(100),"HUB_INVITE_PLAYER|1|chess|Guest");string id=getClient(101)->hubInviteId;

@@ -1,4 +1,5 @@
 #include "accounts.h"
+#include "session_store.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/crypto.h>
@@ -56,7 +57,12 @@ using Socket = int;
 
 using namespace std;
 
+#ifndef JENGCHAT_TEST_PORT
 const int PORT = 54000;
+#else
+const int PORT = JENGCHAT_TEST_PORT;
+#endif
+SessionStore sessions;
 const int BUFFER_SIZE = 2048;
 const int MAX_BLACKJACK_HANDS = 50;
 const int MAX_STARTING_CHIPS = 1000000;
@@ -115,8 +121,13 @@ struct Client {
     SSL* tls = nullptr;
     bool tlsReady = false;
     bool closeRequested = false;
+    bool readClosed = false;
     bool closeAfterFlush = false;
     string peerIP;
+    bool recoveryCapable=false;
+    string sessionHash, pendingResume;
+    std::chrono::steady_clock::time_point lastReceive=std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastPing=std::chrono::steady_clock::now();
     std::deque<string> output;
     size_t outputBytes = 0;
     std::chrono::steady_clock::time_point connectedAt = std::chrono::steady_clock::now();
@@ -375,6 +386,15 @@ vector<ChessGame> chessGames;
 vector<PokerGame> pokerGames;
 vector<RouletteGame> rouletteGames;
 vector<ArenaGame> arenaGames;
+struct PendingAccountChange { string account; shared_future<AccountResult> result; };
+vector<PendingAccountChange> pendingAccountChanges;
+void processAccountRevocations() {
+    for(auto it=pendingAccountChanges.begin();it!=pendingAccountChanges.end();) {
+        if(it->result.wait_for(chrono::seconds(0))!=future_status::ready){++it;continue;}
+        if(it->result.get().ok)sessions.revokeAccount(it->account);
+        it=pendingAccountChanges.erase(it);
+    }
+}
 
 static mt19937 rng(random_device{}());
 
@@ -9083,36 +9103,34 @@ void disconnectClient(int index) {
         if (spectator != game.spectators.end()) {
             game.spectators.erase(spectator);
             sendChessState(game);
-            return;
         }
-
-        if (game.engineGame) {
+        else if (game.engineGame) {
             sendChessEnd(
                 game,
                 name + " disconnected. Chess game ended."
             );
             readyChessPlayers(game);
             chessGames.erase(chessGames.begin() + chessIndex);
-            return;
         }
+        else {
+            Socket opponent =
+                game.white == socket
+                ? game.black
+                : game.white;
 
-        Socket opponent =
-            game.white == socket
-            ? game.black
-            : game.white;
+            sendPacket(
+                opponent,
+                "CHESS_END",
+                name +
+                " disconnected. Chess game ended."
+            );
 
-        sendPacket(
-            opponent,
-            "CHESS_END",
-            name +
-            " disconnected. Chess game ended."
-        );
+            sendReady(opponent);
 
-        sendReady(opponent);
-
-        chessGames.erase(
-            chessGames.begin() + chessIndex
-        );
+            chessGames.erase(
+                chessGames.begin() + chessIndex
+            );
+        }
     }
 
     int blackjackIndex = findBlackjackGame(socket);
@@ -9404,6 +9422,8 @@ void disconnectClient(int index) {
         }
     }
 
+    sessions.detach(clients[index].sessionHash);
+    for(auto& packet:clients[index].output) OPENSSL_cleanse(packet.data(),packet.size());
     if (clients[index].tls) SSL_free(clients[index].tls);
     OPENSSL_cleanse(clients[index].inputBuffer.data(), clients[index].inputBuffer.size());
     CLOSE_SOCKET(socket);
@@ -9475,7 +9495,13 @@ namespace {
         return true;
     }
     void authenticate(Client& c, string& line, Accounts& accounts) {
-        if (c.auth.valid()) return;
+        if (c.auth.valid() || !c.pendingResume.empty()) return;
+        if(line.rfind("AUTH_RESUME|",0)==0) {
+            if(!allowAuth("resume-ip:"+c.peerIP,20)) {sendPacket(c.socket,"AUTH_ERROR","Resume rate limited. Please sign in again.");return;}
+            auto digest=SessionStore::hash(line.substr(12));
+            if(digest.empty()||!sessions.find(digest)) {sendPacket(c.socket,"AUTH_ERROR","Session expired. Please sign in again.");return;}
+            c.pendingResume=digest; return;
+        }
         // Hex encoding avoids protocol delimiters in passwords; TLS supplies confidentiality.
         auto first = line.find('|');
         auto second = first == string::npos ? string::npos : line.find('|', first + 1);
@@ -9502,8 +9528,39 @@ namespace {
         c.auth = accounts.submit(operation == "AUTH_REGISTER", name, std::move(password));
     }
 
+    void completeResume(Socket incoming) {
+        Client* candidate=getClient(incoming); if(!candidate)return;
+        string digest=candidate->pendingResume;
+        auto entry=sessions.find(digest);
+        if(!entry){candidate->pendingResume.clear();sendPacket(incoming,"AUTH_ERROR","Session expired. Please sign in again.");return;}
+        string name=entry->account;
+        for(int n=(int)clients.size()-1;n>=0;--n) {
+            if(clients[n].socket!=incoming && clients[n].name==name) disconnectClient(n);
+        }
+        candidate=getClient(incoming);if(!candidate)return;
+        candidate->pendingResume.clear();candidate->name=name;candidate->sessionHash=digest;
+        candidate->recoveryCapable=true;candidate->lastReceive=candidate->lastPing=chrono::steady_clock::now();sessions.attach(digest);
+        sendPacket(incoming,"AUTH_OK",name);sendPacket(incoming,"SERVER_CAPS","Automatic chat reconnection available.");
+        sendPacket(incoming,"SYS","Chat reconnected. Messages during the gap may have been missed. Games were not resumed.");
+        broadcastSystem(name+" reconnected to chat.");
+    }
+    void handleRecovery(Client& c,const string& line) {
+        if(line=="CLIENT_CAPS|resume-v1") {c.recoveryCapable=true;return;}
+        if(line=="SESSION_START|" && c.recoveryCapable) {
+            if(!c.sessionHash.empty())return;
+            auto token=sessions.issue(c.name);
+            if(token.empty()){sendPacket(c.socket,"SESSION_UNAVAILABLE","Please sign in again after disconnecting.");return;}
+            c.sessionHash=SessionStore::hash(token);sendPacket(c.socket,"SESSION_TOKEN",token);
+            OPENSSL_cleanse(token.data(),token.size());return;
+        }
+        if(line=="SESSION_LOGOUT|") {
+            sessions.revoke(c.sessionHash);c.sessionHash.clear();c.closeAfterFlush=true;return;
+        }
+        if(line=="PING|")sendPacket(c.socket,"PONG","");
+    }
+
     void handleAccountCommand(Client& c, const string& line, Accounts& accounts) {
-        if (c.auth.valid()) {
+        if (c.auth.valid() || pendingAccountChanges.size()>=128) {
             sendPacket(c.socket, "ACCOUNT_ERROR", "Another account change is still processing.");
             return;
         }
@@ -9526,6 +9583,7 @@ namespace {
             }
             c.accountAction = fields[0];
             c.auth = accounts.changeUsername(c.name, std::move(currentPassword), fields[1]);
+            pendingAccountChanges.push_back({c.name,c.auth});
             return;
         }
         if (fields[0] == "ACCOUNT_PASSWORD" && fields.size() == 3) {
@@ -9538,6 +9596,7 @@ namespace {
             }
             c.accountAction = fields[0];
             c.auth = accounts.changePassword(c.name, std::move(currentPassword), std::move(newPassword));
+            pendingAccountChanges.push_back({c.name,c.auth});
             return;
         }
         if (fields[0] == "ACCOUNT_DELETE" && fields.size() == 2) {
@@ -9547,6 +9606,7 @@ namespace {
             }
             c.accountAction = fields[0];
             c.auth = accounts.deleteAccount(c.name, std::move(currentPassword));
+            pendingAccountChanges.push_back({c.name,c.auth});
             return;
         }
         sendPacket(c.socket, "ACCOUNT_ERROR", "Invalid account request.");
@@ -9582,7 +9642,11 @@ int main(int argc, char** argv) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(PORT);
+#ifdef JENGCHAT_TEST_PORT
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
     address.sin_addr.s_addr = INADDR_ANY;
+#endif
     if (!makeNonblocking(listener) || bind(listener, (sockaddr*)&address, sizeof(address)) == SOCKET_ERR ||
         listen(listener, SOMAXCONN) == SOCKET_ERR) {
         cerr << "Cannot listen on port " << PORT << ". Stop the old server first.\n";
@@ -9592,9 +9656,12 @@ int main(int argc, char** argv) {
     auto lastCleanup = chrono::steady_clock::now();
     while (true) {
         auto now = chrono::steady_clock::now();
+        // Account mutations can finish after the requesting transport disappeared.
+        processAccountRevocations();
         if (now - lastCleanup > chrono::minutes(1)) {
             for (auto it = authLimits.begin(); it != authLimits.end();)
                 if (now - it->second.start > chrono::minutes(2)) it = authLimits.erase(it); else ++it;
+            sessions.prune(now);
             lastCleanup = now;
         }
         // All socket/TLS calls are nonblocking. Password work runs on a bounded worker queue.
@@ -9626,6 +9693,10 @@ int main(int argc, char** argv) {
             Client& c = clients[i];
             bool expired = !c.tlsReady ? now - c.connectedAt > chrono::seconds(10)
                 : c.name.empty() && now - c.connectedAt > chrono::seconds(60);
+            if(c.recoveryCapable && !c.name.empty()) {
+                if(now-c.lastReceive>=chrono::seconds(45))c.closeRequested=true;
+                else if(now-c.lastPing>=chrono::seconds(15)){sendPacket(c.socket,"PING","");c.lastPing=now;}
+            }
             if (c.closeRequested || expired) { disconnectClient(i); continue; }
             if (!c.tlsReady) {
                 ERR_clear_error();
@@ -9645,6 +9716,7 @@ int main(int argc, char** argv) {
                     if (result.ok) {
                         c.name = result.username;
                         sendPacket(c.socket, "AUTH_OK", c.name);
+                        sendPacket(c.socket, "SERVER_CAPS", "Automatic chat reconnection available.");
                         sendPacket(c.socket, "SYS", "Welcome to JENG CHAT, " + c.name + "!");
                         broadcastSystem(c.name + " joined the chat.");
                     } else sendPacket(c.socket, "AUTH_ERROR", result.message);
@@ -9658,6 +9730,7 @@ int main(int argc, char** argv) {
                         sendPacket(c.socket, "ACCOUNT_ERROR", "That username is already signed in.");
                     } else {
                         string oldName = c.name;
+                        sessions.revokeAccount(oldName);c.sessionHash.clear();sendPacket(c.socket,"SESSION_REVOKED","");
                         c.name = result.username;
                         sendPacket(c.socket, "ACCOUNT_USERNAME", c.name);
                         // Poker seats keep a name snapshot for packet records.
@@ -9677,9 +9750,11 @@ int main(int argc, char** argv) {
                     }
                 }
                 else if (action == "ACCOUNT_PASSWORD") {
+                    sessions.revokeAccount(c.name);c.sessionHash.clear();sendPacket(c.socket,"SESSION_REVOKED","");
                     sendPacket(c.socket, "ACCOUNT_PASSWORD", result.message);
                 }
                 else if (action == "ACCOUNT_DELETE") {
+                    sessions.revokeAccount(c.name);c.sessionHash.clear();sendPacket(c.socket,"SESSION_REVOKED","");
                     sendPacket(c.socket, "ACCOUNT_DELETED", result.message);
                     c.closeAfterFlush = true;
                 }
@@ -9694,7 +9769,7 @@ int main(int argc, char** argv) {
                     if (!tlsRetry(c.tls, sent)) c.closeRequested = true;
                     writePending = true; break;
                 }
-                c.outputBytes -= message.size(); c.output.pop_front();
+                c.outputBytes -= message.size(); OPENSSL_cleanse(c.output.front().data(),c.output.front().size()); c.output.pop_front();
             }
             if (c.closeAfterFlush && c.output.empty()) c.closeRequested = true;
             if (!writePending && !c.closeRequested) {
@@ -9703,7 +9778,7 @@ int main(int argc, char** argv) {
                     ERR_clear_error();
                     int received = SSL_read(c.tls, buffer, sizeof(buffer));
                     if (received <= 0) {
-                        if (!tlsRetry(c.tls, received)) c.closeRequested = true;
+                        if (!tlsRetry(c.tls, received)) c.readClosed = true;
                         break;
                     }
                     c.inputBuffer.append(buffer, received);
@@ -9720,11 +9795,16 @@ int main(int argc, char** argv) {
                 OPENSSL_cleanse(c.inputBuffer.data(), end);
                 c.inputBuffer.erase(0, end + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
+                c.lastReceive=chrono::steady_clock::now();
                 if (c.name.empty()) authenticate(c, line, *accounts);
+                else if(line.rfind("CLIENT_CAPS|",0)==0 || line.rfind("SESSION_",0)==0 || line=="PING|" || line=="PONG|") handleRecovery(c,line);
                 else if (line.rfind("ACCOUNT_", 0) == 0) handleAccountCommand(c, line, *accounts);
                 else { handleCommand(c, line); sendReady(c.socket); }
                 OPENSSL_cleanse(line.data(), line.size());
+                if(!c.pendingResume.empty() || c.closeAfterFlush)break;
             }
+            if(c.readClosed)c.closeRequested=true;
+            if(!c.closeRequested && !c.pendingResume.empty()){Socket incomingSocket=c.socket;completeResume(incomingSocket);i=0;continue;}
             if (c.closeRequested) { disconnectClient(i); continue; }
             ++i;
         }

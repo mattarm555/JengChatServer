@@ -1,0 +1,36 @@
+name: Server recovery validation
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Restore build dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ libssl-dev libsodium-dev libsqlite3-dev
+      - name: Build and test production cleanup and serialization
+        run: |
+          mkdir -p build/staged
+          g++ -std=c++17 -O2 -Wall -Wextra server.cpp accounts.cpp -o build/staged/jengchat_server -lssl -lcrypto -lsodium -lsqlite3 -pthread
+          g++ -std=c++17 -O1 tests/recovery.cpp accounts.cpp -o build/recovery-tests -lssl -lcrypto -lsodium -lsqlite3 -pthread
+          ./build/recovery-tests
+          g++ -std=c++17 -O1 tests/roulette_broadcast.cpp accounts.cpp -o build/roulette-tests -lssl -lcrypto -lsodium -lsqlite3 -pthread
+          ./build/roulette-tests
+          git rev-parse HEAD > build/staged/COMMIT.txt
+          git archive --format=tar.gz --prefix=JengChatServer/ HEAD > build/staged/JengChatServer-source.tar.gz
+          dpkg-query -W g++ libssl-dev libsodium-dev libsqlite3-dev > build/staged/DEPENDENCIES.txt
+          ldd build/staged/jengchat_server > build/staged/RUNTIME.txt
+          cp RECOVERY_PROTOCOL.md SERVER_DEPLOYMENT.md build/staged/
+          cd build/staged && sha256sum * > SHA256SUMS.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: staged-server-recovery
+          path: build/staged/*
+          if-no-files-found: error

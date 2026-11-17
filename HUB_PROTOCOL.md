@@ -12,7 +12,7 @@ Activity is Available, In lobby, Playing, or Spectating; only authenticated serv
 
 - `HUB_VISIBILITY|request|lobbyId|0-or-1`: host of a waiting lobby only.
 - `HUB_JOIN|request|lobbyId`: revalidate visibility, phase, capacity and participant availability, then use the existing /accept admission handler. Never auto-start.
-- `HUB_INVITE_PLAYER|request|game|username`: use existing host/challenge permission checks. `chess_spectate` is distinct from `chess`.
+- `HUB_INVITE_PLAYER|request|game|username`: use existing host/challenge permission checks. `chess_spectate` is distinct from `chess`. For `chess` only, an optional fifth field `minutes+increment` asks for a timed game (`HUB_INVITE_PLAYER|request|chess|username|5+3`); send it only to servers that answered `CHESS_CAPS|clock-v1`, since older servers reject five fields. The invitation's settings then read `Chess 5+3` instead of `Standard chess`. See CHESS_CLOCK.md.
 - `HUB_ACCEPT|request|invitationId` and `HUB_DECLINE|request|invitationId`: operate only on the current invitation.
 - `HUB_RESULT|request|0-or-1|game|message`: correlated outcome. Last 16 results per transport are cached; duplicate request IDs return their original result. Request IDs are 1-32 alphanumeric/hyphen characters. Mutations are limited to 20/minute/transport; connection/session/authentication bounds remain in force.
 - `HUB_INVITE|id|game|inviter|occupied|capacity|settings|play-or-spectate|remainingSeconds`: current invitation details. Details refresh when capacity/settings change without extending expiry; admission is rechecked on acceptance. Zero capacity identifies a spectator invitation.

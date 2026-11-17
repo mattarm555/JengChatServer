@@ -50,25 +50,25 @@ int main(){try{
     // Timed challenge: starting clock, nothing running before both first moves.
     start("1+2");ChessGame* g=&chessGames[0];
     require(g->timed&&g->baseMs==60000&&g->incMs==2000&&g->whiteMs==60000&&g->blackMs==60000,"timed fields");
-    require(has(100,"Time control 1+2")&&last(100,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|-|60|2","start clock");
+    require(has(100,"Time control 1+2")&&last(100,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|-|60|2|0","start clock");
     getClient(102)->pendingChallenge=100;getClient(102)->pendingGame="chess_spectate";cmd(102,"/accept");
     getClient(103)->pendingChallenge=100;getClient(103)->pendingGame="chess_spectate";cmd(103,"/accept");
     g=&chessGames[0];require(g->spectators.size()==2,"spectators not seated");
-    require(last(102,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|-|60|2","capable spectator join missed clock");
+    require(last(102,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|-|60|2|0","capable spectator join missed clock");
     require(count(103,"CHESS_CLOCK|")==0,"non-capable spectator got CHESS_CLOCK");
     clearOutput();advance(10000);cmd(100,"CHESS_MOVE|e2|e4");g=&chessGames[0];
     require(g->whiteMs==60000&&!g->clockRunning,"white charged before both first moves");
-    require(last(101,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|-|60|2","clock after white's first move");
+    require(last(101,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|-|60|2|0","clock after white's first move");
     advance(15000);cmd(101,"CHESS_MOVE|e7|e5");g=&chessGames[0];
     require(g->blackMs==60000&&g->clockRunning&&g->clockWhite,"white clock not started after black's first move");
-    require(last(100,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|WHITE|60|2","running clock packet");
-    require(last(102,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|WHITE|60|2","spectator missed running clock");
+    require(last(100,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|WHITE|60|2|0","running clock packet");
+    require(last(102,"CHESS_CLOCK|")=="CHESS_CLOCK|60000|60000|WHITE|60|2|0","spectator missed running clock");
     require(count(103,"CHESS_CLOCK|")==0,"non-capable spectator got running clock");
 
     // Running clock and increment: white spends 3s and gains 2s.
     advance(3000);cmd(100,"CHESS_MOVE|g1|f3");g=&chessGames[0];
     require(g->whiteMs==59000&&g->clockRunning&&!g->clockWhite,"increment/elapsed wrong for white");
-    require(last(101,"CHESS_CLOCK|")=="CHESS_CLOCK|59000|60000|BLACK|60|2","clock after increment");
+    require(last(101,"CHESS_CLOCK|")=="CHESS_CLOCK|59000|60000|BLACK|60|2|0","clock after increment");
     advance(500);processChessClocks();require(chessGames.size()==1,"flagged too early");
     advance(1500);cmd(101,"CHESS_MOVE|b8|c6");g=&chessGames[0];
     require(g->blackMs==60000&&g->clockWhite,"black increment wrong");
@@ -79,7 +79,7 @@ int main(){try{
     clearOutput();advance(58999);processChessClocks();require(chessGames.size()==1,"flagged with time left");
     advance(1);processChessClocks();require(chessGames.empty(),"flag did not end the game");
     for(Socket s:{100,101,102,103})require(has(s,"CHESS_END|TIME - Bob wins on time.|"),"flag end text missing");
-    require(last(100,"CHESS_CLOCK|")=="CHESS_CLOCK|0|60000|-|60|2"&&last(102,"CHESS_CLOCK|")=="CHESS_CLOCK|0|60000|-|60|2","final clock");
+    require(last(100,"CHESS_CLOCK|")=="CHESS_CLOCK|0|60000|-|60|2|0"&&last(102,"CHESS_CLOCK|")=="CHESS_CLOCK|0|60000|-|60|2|0","final clock");
     require(count(103,"CHESS_CLOCK|")==0,"final clock reached non-capable spectator");
     require(has(100,"Alice ran out of time."),"flag notice");
 
@@ -89,7 +89,37 @@ int main(){try{
 
     // Resignation freezes and sends the final clock.
     start("1+0");cmd(100,"CHESS_MOVE|e2|e4");cmd(101,"CHESS_MOVE|e7|e5");clearOutput();advance(4000);cmd(100,"/resign");
-    require(chessGames.empty()&&last(101,"CHESS_CLOCK|")=="CHESS_CLOCK|56000|60000|-|60|0"&&has(101,"wins by resignation"),"resign clock");
+    require(chessGames.empty()&&last(101,"CHESS_CLOCK|")=="CHESS_CLOCK|56000|60000|-|60|0|0"&&has(101,"wins by resignation"),"resign clock");
+
+    // Grace: a capture or a check makes the opponent's clock wait 2 s; a quiet move doesn't.
+    start("1+0");cmd(100,"CHESS_MOVE|e2|e4");cmd(101,"CHESS_MOVE|d7|d5");g=&chessGames[0];
+    require(g->clockRunning&&g->clockWhite&&g->graceMs==0,"grace after a quiet first move");
+    clearOutput();advance(1000);cmd(100,"CHESS_MOVE|e4|d5");g=&chessGames[0];
+    require(!g->clockWhite&&g->graceMs==2000&&last(101,"CHESS_CLOCK|")=="CHESS_CLOCK|59000|60000|BLACK|60|0|2000","capture gave no grace");
+    advance(1500);require(chessRemainingMs(chessGames[0],false,fakeNow)==60000&&chessGraceLeftMs(chessGames[0],fakeNow)==500,"clock ran during grace");
+    advance(1000);require(chessRemainingMs(chessGames[0],false,fakeNow)==59500,"clock didn't run after grace");
+    cmd(101,"CHESS_MOVE|d8|d5");g=&chessGames[0];
+    require(g->blackMs==59500&&g->clockWhite&&g->graceMs==2000,"black's capture gave white no grace");
+    advance(2000);clearOutput();cmd(100,"CHESS_MOVE|f1|b5");g=&chessGames[0];
+    require(g->whiteMs==59000&&!g->clockWhite&&g->graceMs==2000&&last(101,"CHESS_CLOCK|").substr(last(101,"CHESS_CLOCK|").size()-5)=="|2000","check gave no grace");
+    advance(500);clearOutput();cmd(101,"CHESS_MOVE|c7|c6");g=&chessGames[0];
+    require(g->blackMs==59500&&g->clockWhite&&g->graceMs==0&&last(100,"CHESS_CLOCK|")=="CHESS_CLOCK|59000|59500|WHITE|60|0|0","quiet move gave grace");
+    // The grace never adds time: a flag still falls when the clock runs out after it.
+    advance(58999);processChessClocks();require(chessGames.size()==1,"flagged early");
+    advance(1);processChessClocks();require(chessGames.empty()&&has(101,"TIME - Bob wins on time."),"flag after grace");
+    // Grace on a flag-edge: with 1 s left and a check against them, a player still has the 2 s grace plus 1 s.
+    start("1+0");cmd(100,"CHESS_MOVE|e2|e4");cmd(101,"CHESS_MOVE|d7|d5");advance(1000);cmd(100,"CHESS_MOVE|e4|d5");
+    chessGames[0].blackMs=1000;advance(2999);processChessClocks();require(chessGames.size()==1,"grace not honoured near the flag");
+    advance(1);processChessClocks();require(chessGames.empty(),"flag after grace and last second");
+
+    // En passant captures an off-destination pawn and grants the same grace.
+    start("1+0");cmd(100,"CHESS_MOVE|e2|e4");cmd(101,"CHESS_MOVE|a7|a6");
+    cmd(100,"CHESS_MOVE|e4|e5");cmd(101,"CHESS_MOVE|d7|d5");cmd(100,"CHESS_MOVE|e5|d6");
+    require(chessGames[0].board[2][3]=='P'&&chessGames[0].board[3][3]==' '&&chessGames[0].graceMs==2000,"en passant gave no grace");
+    advance(500);sendChessState(chessGames[0]);
+    require(chessGraceLeftMs(chessGames[0],fakeNow)==1500,"state resend restarted grace");
+    cmd(101,"/resign");
+    require(last(100,"CHESS_CLOCK|").substr(last(100,"CHESS_CLOCK|").size()-2)=="|0","resignation kept grace running");
 
     // Untimed fallback with a non-capable peer.
     for(int side=0;side<2;++side){
@@ -119,6 +149,6 @@ int main(){try{
     reset();add(100,"Alice",true);add(101,"Bob",true);cmd(100,"/chess Bob 5+0");cmd(101,"/decline");
     require(getClient(101)->pendingClockMinutes==0&&getClient(101)->pendingClockIncrement==0,"decline kept time control");
 
-    std::cout<<"PASS: caps, bad/valid time controls, untimed unchanged, first-move rule, increment, tick and late-move flags, resign clock, "
+    std::cout<<"PASS: caps, bad/valid time controls, untimed unchanged, first-move rule, increment, tick and late-move flags, resign clock, grace after captures and checks, "
                "non-capable fallback, capable/non-capable spectators, engine untimed, hub time controls, decline cleanup\n";return 0;
 }catch(const exception& e){cerr<<e.what()<<'\n';return 1;}}

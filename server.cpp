@@ -281,7 +281,13 @@ struct ChessGame {
     bool clockRunning = false;
     bool clockWhite = true;
     chrono::steady_clock::time_point runningSince{};
+    // Grace (CHESS_CLOCK.md): after a capture or a check, the side to move's
+    // clock waits this long before it runs. The same rule for both players.
+    long long graceMs = 0;
 };
+
+// The grace given to the side to move after a capture or a check.
+const long long ChessGraceMs = 2000;
 
 
 enum class PokerStage {
@@ -829,9 +835,21 @@ long long chessRemainingMs(
 ) {
     long long remaining = white ? game.whiteMs : game.blackMs;
     if (game.clockRunning && game.clockWhite == white)
-        remaining -= chrono::duration_cast<chrono::milliseconds>(
-            now - game.runningSince).count();
+        remaining -= max(0LL, chrono::duration_cast<chrono::milliseconds>(
+            now - game.runningSince).count() - game.graceMs);
     return max(0LL, remaining);
+}
+
+// How much of the running side's grace is left (0 when none or no clock runs).
+long long chessGraceLeftMs(
+    const ChessGame& game,
+    chrono::steady_clock::time_point now
+) {
+    if (!game.clockRunning || game.graceMs <= 0)
+        return 0;
+    long long elapsed = chrono::duration_cast<chrono::milliseconds>(
+        now - game.runningSince).count();
+    return max(0LL, game.graceMs - elapsed);
 }
 
 // Charges the running side for elapsed time and stops the clock.
@@ -848,8 +866,10 @@ bool chessClockCapable(Socket socket) {
     return client && client->chessClockCapable;
 }
 
-// CHESS_CLOCK|whiteMs|blackMs|WHITE-or-BLACK-or-dash|baseSec|incSec
+// CHESS_CLOCK|whiteMs|blackMs|WHITE-or-BLACK-or-dash|baseSec|incSec|graceMs
 // Only timed games send it, and only to clients that probed chess-clock-v1.
+// graceMs (grace left before the running clock counts) was added later;
+// clients that read only the first five fields keep working.
 void sendChessClockTo(ChessGame& game, Socket socket) {
     if (!game.timed || socket == INVALID_SOCK || !chessClockCapable(socket))
         return;
@@ -861,7 +881,8 @@ void sendChessClockTo(ChessGame& game, Socket socket) {
         to_string(chessRemainingMs(game, false, now)) + "|" +
         (game.clockRunning ? (game.clockWhite ? "WHITE" : "BLACK") : "-") + "|" +
         to_string(game.baseMs / 1000) + "|" +
-        to_string(game.incMs / 1000)
+        to_string(game.incMs / 1000) + "|" +
+        to_string(chessGraceLeftMs(game, now))
     );
 }
 
@@ -1808,6 +1829,11 @@ void playChessMove(
         return;
     }
 
+    // A capture (en passant too) or a check gives the opponent the clock's grace.
+    char movingPiece = game.board[fromRow][fromCol];
+    bool capture = game.board[toRow][toCol] != ' ' ||
+        (tolower((unsigned char)movingPiece) == 'p' && fromCol != toCol);
+
     applyChessMoveUnchecked(
         game,
         fromRow,
@@ -1824,10 +1850,13 @@ void playChessMove(
         if (wasRunning)
             (white ? game.whiteMs : game.blackMs) += game.incMs;
         (white ? game.whiteMoved : game.blackMoved) = true;
+        game.graceMs = 0;
         if (game.whiteMoved && game.blackMoved) {
             game.clockRunning = true;
             game.clockWhite = !white;
             game.runningSince = now;
+            if (capture || chessInCheck(game, !white))
+                game.graceMs = ChessGraceMs;
         }
     }
 

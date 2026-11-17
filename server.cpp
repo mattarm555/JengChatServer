@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cctype>
 #include <random>
 #include <csignal>
@@ -447,6 +448,32 @@ void sendPacket(
         socket,
         type + "|" + text + "\n"
     );
+}
+
+
+bool handleStatusQuery(Client& client, const string& line) {
+    static const string prefix = "STATUS|";
+    if (line.compare(0, prefix.size(), prefix) != 0) return false;
+
+    const char* token = std::getenv("JENGCHAT_STATUS_TOKEN");
+    client.closeAfterFlush = true;
+    if (!token) return true;
+    const size_t tokenLength = std::char_traits<char>::length(token);
+    if (tokenLength < 32 || line.size() != prefix.size() + tokenLength ||
+        CRYPTO_memcmp(line.data() + prefix.size(), token, tokenLength) != 0) {
+        return true;
+    }
+
+    // One line per account, terminated by a blank line. Account names
+    // cannot contain newlines, and unauthenticated sockets have no name.
+    string roster = "STATUS\n";
+    for (const auto& connected : clients) {
+        if (!connected.name.empty() && !connected.closeRequested && !connected.closeAfterFlush)
+            roster += connected.name + "\n";
+    }
+    roster += "\n";
+    sendAll(client.socket, roster);
+    return true;
 }
 
 void sendReady(Socket socket) {
@@ -9826,7 +9853,9 @@ int main(int argc, char** argv) {
                 c.inputBuffer.erase(0, end + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 c.lastReceive=chrono::steady_clock::now();
-                if (c.name.empty()) authenticate(c, line, *accounts);
+                if (c.name.empty()) {
+                    if (!handleStatusQuery(c, line)) authenticate(c, line, *accounts);
+                }
                 else if(line.rfind("CLIENT_CAPS|",0)==0 || line.rfind("SESSION_",0)==0 || line=="PING|" || line=="PONG|") handleRecovery(c,line);
                 else if (line.rfind("ACCOUNT_", 0) == 0) handleAccountCommand(c, line, *accounts);
                 else if (line.rfind("LOUNGE_", 0) == 0) lounge::handle(c, line); // ephemeral relay: no READY

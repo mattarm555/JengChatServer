@@ -46,7 +46,10 @@ void hubMaintain(HubClock::time_point now=HubClock::now()) {
         if(kind=="chess_spectate") {
             int i=findChessGame(c.pendingChallenge);valid=valid&&i>=0;
             settings="Watch the current chess game";seats=0;capacity=0;
-        } else if(kind=="chess")valid=valid&&!isPlayerBusy(c.pendingChallenge);
+        } else if(kind=="chess") {
+            valid=valid&&!isPlayerBusy(c.pendingChallenge);
+            if(c.pendingClockMinutes>0)settings="Chess "+chessTimeControlText(c.pendingClockMinutes,c.pendingClockIncrement);
+        }
         else {
             bool found=false;
             for(auto& e:entries)if(e.host==c.pendingChallenge&&e.kind==kind) {
@@ -139,7 +142,8 @@ void handleCommand(Client& c,const string& line) {
         }
         hubResult(c,request,false,"none","Lobby closed.");return;
     }
-    if(f[0]=="HUB_INVITE_PLAYER"&&f.size()==4) {
+    // Chess may carry a fifth field, minutes+increment (CHESS_CLOCK.md).
+    if(f[0]=="HUB_INVITE_PLAYER"&&(f.size()==4||(f.size()==5&&f[2]=="chess"))) {
         Client* target=getClientByName(f[3]);
         string cmd=f[2]=="arena"?"ARENA_INVITE|":f[2]=="chess_spectate"?"CHESS_SPECTATE_INVITE|":
             f[2]=="chess"?"/chess ":f[2]=="blackjack"?"/blackjack ":f[2]=="roulette"?"/roulette ":f[2]=="poker"?"/poker ":"";
@@ -147,7 +151,7 @@ void handleCommand(Client& c,const string& line) {
             hubResult(c,request,false,"none","Player unavailable.");return;
         }
         // Legacy commands retain authority over host, capacity, and busy checks.
-        handleLegacyCommand(c,cmd+target->name);hubMaintain();
+        handleLegacyCommand(c,cmd+target->name+(f.size()==5?" "+f[4]:""));hubMaintain();
         bool ok=target->pendingChallenge==c.socket&&target->pendingGame==f[2]&&c.hubError.empty();
         hubResult(c,request,ok,f[2],ok?"Invitation sent to "+target->name+".":c.hubError.empty()?"Invitation unavailable.":c.hubError);
         hubSnapshot(c);return;

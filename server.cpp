@@ -132,6 +132,8 @@ struct Client {
     deque<pair<string,string>> hubResults;
     deque<chrono::steady_clock::time_point> hubCommands;
     bool recoveryCapable=false;
+    // Chess clocks (CHESS_CLOCK.md): probed with CLIENT_CAPS|chess-clock-v1.
+    bool chessClockCapable=false;
     // Lounge presence relay (lounge.h): probed, lounge on screen, last canonical position, rate limits.
     bool loungeCapable=false, loungeIn=false;
     string loungePosition;
@@ -151,6 +153,9 @@ struct Client {
     string pendingGame;
     int pendingChips = 0;
     int pendingHands = 0;
+    // Time control of a pending /chess challenge; 0 minutes = untimed.
+    int pendingClockMinutes = 0;
+    int pendingClockIncrement = 0;
 };
 
 struct Card {
@@ -262,6 +267,20 @@ struct ChessGame {
     // En-passant destination square, or -1/-1 when unavailable.
     int enPassantRow = -1;
     int enPassantCol = -1;
+
+    // Chess clock (CHESS_CLOCK.md). Untimed games keep timed=false.
+    // No clock runs until each side has made its first move; after that
+    // the side to move runs and its increment is added after each move.
+    bool timed = false;
+    long long baseMs = 0;
+    long long incMs = 0;
+    long long whiteMs = 0;
+    long long blackMs = 0;
+    bool whiteMoved = false;
+    bool blackMoved = false;
+    bool clockRunning = false;
+    bool clockWhite = true;
+    chrono::steady_clock::time_point runningSince{};
 };
 
 
@@ -531,6 +550,8 @@ void clearPendingChallenge(Client& client) {
     client.pendingGame.clear();
     client.pendingChips = 0;
     client.pendingHands = 0;
+    client.pendingClockMinutes = 0;
+    client.pendingClockIncrement = 0;
 }
 
 void broadcastSystem(const string& message) {
@@ -778,6 +799,79 @@ string encodeChessEnPassant(const ChessGame& game) {
     return chessSquareName(game.enPassantRow, game.enPassantCol);
 }
 
+// Tests replace this to step time without sleeping.
+chrono::steady_clock::time_point (*chessClockNow)() = [] {
+    return chrono::steady_clock::now();
+};
+
+// Parses "<minutes>+<increment>" with 1-60 minutes and 0-60 seconds.
+bool parseChessTimeControl(const string& text, int& minutes, int& increment) {
+    size_t plus = text.find('+');
+    if (plus == string::npos || plus == 0 || plus + 1 >= text.size() ||
+        plus > 2 || text.size() - plus - 1 > 2)
+        return false;
+    for (size_t i = 0; i < text.size(); i++)
+        if (i != plus && !isdigit((unsigned char)text[i]))
+            return false;
+    minutes = stoi(text.substr(0, plus));
+    increment = stoi(text.substr(plus + 1));
+    return minutes >= 1 && minutes <= 60 && increment >= 0 && increment <= 60;
+}
+
+string chessTimeControlText(int minutes, int increment) {
+    return to_string(minutes) + "+" + to_string(increment);
+}
+
+long long chessRemainingMs(
+    const ChessGame& game,
+    bool white,
+    chrono::steady_clock::time_point now
+) {
+    long long remaining = white ? game.whiteMs : game.blackMs;
+    if (game.clockRunning && game.clockWhite == white)
+        remaining -= chrono::duration_cast<chrono::milliseconds>(
+            now - game.runningSince).count();
+    return max(0LL, remaining);
+}
+
+// Charges the running side for elapsed time and stops the clock.
+void settleChessClock(ChessGame& game, chrono::steady_clock::time_point now) {
+    if (!game.timed || !game.clockRunning)
+        return;
+    long long& remaining = game.clockWhite ? game.whiteMs : game.blackMs;
+    remaining = chessRemainingMs(game, game.clockWhite, now);
+    game.clockRunning = false;
+}
+
+bool chessClockCapable(Socket socket) {
+    Client* client = getClient(socket);
+    return client && client->chessClockCapable;
+}
+
+// CHESS_CLOCK|whiteMs|blackMs|WHITE-or-BLACK-or-dash|baseSec|incSec
+// Only timed games send it, and only to clients that probed chess-clock-v1.
+void sendChessClockTo(ChessGame& game, Socket socket) {
+    if (!game.timed || socket == INVALID_SOCK || !chessClockCapable(socket))
+        return;
+    auto now = chessClockNow();
+    sendPacket(
+        socket,
+        "CHESS_CLOCK",
+        to_string(chessRemainingMs(game, true, now)) + "|" +
+        to_string(chessRemainingMs(game, false, now)) + "|" +
+        (game.clockRunning ? (game.clockWhite ? "WHITE" : "BLACK") : "-") + "|" +
+        to_string(game.baseMs / 1000) + "|" +
+        to_string(game.incMs / 1000)
+    );
+}
+
+void sendChessClock(ChessGame& game) {
+    sendChessClockTo(game, game.white);
+    sendChessClockTo(game, game.black);
+    for (Socket spectator : game.spectators)
+        sendChessClockTo(game, spectator);
+}
+
 void sendChessStateTo(
     ChessGame& game,
     Socket socket
@@ -815,6 +909,7 @@ void sendChessStateTo(
     }
 
     sendPacket(socket, "CHESS_STATE", data);
+    sendChessClockTo(game, socket);
 }
 
 void sendChessState(ChessGame& game) {
@@ -830,6 +925,9 @@ void sendChessEnd(
     ChessGame& game,
     const string& text
 ) {
+    // Freeze and publish the final clock before CHESS_END.
+    settleChessClock(game, chessClockNow());
+    sendChessClock(game);
     string payload =
         text + "|" +
         encodeChessBoard(game) + "|" +
@@ -1574,6 +1672,42 @@ void showChessBoard(
     sendChessState(game);
 }
 
+// Ends a timed game whose running clock reached zero. Returns true if the
+// game at gameIndex was removed.
+bool flagChessGameIfExpired(
+    int gameIndex,
+    chrono::steady_clock::time_point now
+) {
+    if (gameIndex < 0 || gameIndex >= (int)chessGames.size())
+        return false;
+    ChessGame& game = chessGames[gameIndex];
+    if (!game.timed || !game.clockRunning ||
+        chessRemainingMs(game, game.clockWhite, now) > 0)
+        return false;
+
+    Socket flagged = game.clockWhite ? game.white : game.black;
+    Socket winner = game.clockWhite ? game.black : game.white;
+    Socket whiteSocket = game.white;
+    Socket blackSocket = game.black;
+    string winnerName = getName(winner);
+
+    sendChessLine(game, getName(flagged) + " ran out of time.");
+    sendChessEnd(game, "TIME - " + winnerName + " wins on time.");
+
+    if (whiteSocket != INVALID_SOCK) sendReady(whiteSocket);
+    if (blackSocket != INVALID_SOCK) sendReady(blackSocket);
+
+    chessGames.erase(chessGames.begin() + gameIndex);
+    return true;
+}
+
+// Called from the server loop tick.
+void processChessClocks() {
+    auto now = chessClockNow();
+    for (int i = (int)chessGames.size() - 1; i >= 0; i--)
+        flagChessGameIfExpired(i, now);
+}
+
 void playChessMove(
     int gameIndex,
     Client& client,
@@ -1593,6 +1727,10 @@ void playChessMove(
         );
         return;
     }
+
+    // A move that arrives after the mover's flag fell loses on time.
+    if (flagChessGameIfExpired(gameIndex, chessClockNow()))
+        return;
 
     ChessGame& game = chessGames[gameIndex];
 
@@ -1678,6 +1816,21 @@ void playChessMove(
         toCol,
         promotion
     );
+
+    if (game.timed) {
+        auto now = chessClockNow();
+        bool wasRunning = game.clockRunning;
+        settleChessClock(game, now);
+        if (wasRunning)
+            (white ? game.whiteMs : game.blackMs) += game.incMs;
+        (white ? game.whiteMoved : game.blackMoved) = true;
+        if (game.whiteMoved && game.blackMoved) {
+            game.clockRunning = true;
+            game.clockWhite = !white;
+            game.runningSince = now;
+        }
+    }
+
     cerr
         << "[Chess] applied move: "
         << chessSquareName(fromRow, fromCol) << "-"
@@ -6792,17 +6945,34 @@ void handleLegacyCommand(Client& client, const string& line) {
     // --------------------------------------------------------
 
     else if (command == "/chess") {
-        string targetName;
-        ss >> targetName;
+        string targetName, timeControl, extra;
+        ss >> targetName >> timeControl >> extra;
 
         if (targetName.empty()) {
             sendPacket(
                 client.socket,
                 "ERR",
-                "Usage: /chess <username>"
+                "Usage: /chess <username> [minutes+increment]"
             );
             return;
         }
+
+        int clockMinutes = 0;
+        int clockIncrement = 0;
+        if (!extra.empty() ||
+            (!timeControl.empty() &&
+             !parseChessTimeControl(timeControl, clockMinutes, clockIncrement))) {
+            sendPacket(
+                client.socket,
+                "ERR",
+                "Time control must be minutes+increment, e.g. 5+3 "
+                "(1-60 minutes, 0-60 second increment)."
+            );
+            return;
+        }
+        string timeLabel = clockMinutes > 0
+            ? " (" + chessTimeControlText(clockMinutes, clockIncrement) + ")"
+            : "";
 
         if (isPlayerBusy(client.socket)) {
             sendPacket(
@@ -6856,12 +7026,15 @@ void handleLegacyCommand(Client& client, const string& line) {
         target->pendingGame = "chess";
         target->pendingChips = 0;
         target->pendingHands = 0;
+        target->pendingClockMinutes = clockMinutes;
+        target->pendingClockIncrement = clockIncrement;
 
         sendPacket(
             client.socket,
             "CHESS_NOTICE",
             "Challenge sent to " +
             target->name +
+            timeLabel +
             ". You will play White."
         );
 
@@ -6870,7 +7043,9 @@ void handleLegacyCommand(Client& client, const string& line) {
             "GAME",
             "*** " +
             client.name +
-            " challenged you to Chess! ***"
+            " challenged you to Chess" +
+            timeLabel +
+            "! ***"
         );
 
         sendPacket(
@@ -7502,6 +7677,8 @@ void handleLegacyCommand(Client& client, const string& line) {
         }
 
         string gameType = client.pendingGame;
+        int clockMinutes = client.pendingClockMinutes;
+        int clockIncrement = client.pendingClockIncrement;
 
         Socket challengerSocket = challenger->socket;
         Socket accepterSocket = client.socket;
@@ -7893,6 +8070,20 @@ void handleLegacyCommand(Client& client, const string& line) {
                 accepterSocket
             );
 
+            // A timed game needs both players' clients to show the clock.
+            vector<string> clocklessPlayers;
+            if (clockMinutes > 0) {
+                for (Socket player : {challengerSocket, accepterSocket})
+                    if (!chessClockCapable(player))
+                        clocklessPlayers.push_back(getName(player));
+                if (clocklessPlayers.empty()) {
+                    game.timed = true;
+                    game.baseMs = clockMinutes * 60000LL;
+                    game.incMs = clockIncrement * 1000LL;
+                    game.whiteMs = game.blackMs = game.baseMs;
+                }
+            }
+
             chessGames.push_back(game);
 
             ChessGame& created = chessGames.back();
@@ -7901,6 +8092,19 @@ void handleLegacyCommand(Client& client, const string& line) {
                 created,
                 "*** Chess challenge accepted! ***"
             );
+
+            for (const string& name : clocklessPlayers)
+                sendChessLine(
+                    created,
+                    name + "'s client doesn't support clocks; playing untimed."
+                );
+            if (created.timed)
+                sendChessLine(
+                    created,
+                    "Time control " +
+                    chessTimeControlText(clockMinutes, clockIncrement) +
+                    ". Clocks start after each side's first move."
+                );
 
             sendChessLine(
                 created,
@@ -9169,6 +9373,8 @@ void disconnectClient(int index) {
                 ? game.black
                 : game.white;
 
+            settleChessClock(game, chessClockNow());
+            sendChessClockTo(game, opponent);
             sendPacket(
                 opponent,
                 "CHESS_END",
@@ -9599,6 +9805,7 @@ namespace {
         // Unknown CLIENT_CAPS are safely ignored by beta 3. Only advertise hub
         // packets to clients that probe, so legacy chat never displays wire IDs.
         if(line=="CLIENT_CAPS|hub-v1"){sendPacket(c.socket,"HUB_CAPS","hub-v1");return;}
+        if(line=="CLIENT_CAPS|chess-clock-v1"){c.chessClockCapable=true;sendPacket(c.socket,"CHESS_CAPS","clock-v1");return;}
         if(line=="CLIENT_CAPS|lounge-v1"){c.loungeCapable=true;sendPacket(c.socket,"LOUNGE_CAPS","lounge-v1");return;}
         if(line=="CLIENT_CAPS|resume-v1") {c.recoveryCapable=true;return;}
         if(line=="SESSION_START|" && c.recoveryCapable) {
@@ -9744,6 +9951,7 @@ int main(int argc, char** argv) {
         }
         processBlackjackDealTimers();
         processArenaRealtimeTick();
+        processChessClocks();
         hubMaintain();
         for (int i = 0; i < (int)clients.size();) {
             Client& c = clients[i];

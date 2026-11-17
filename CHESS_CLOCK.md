@@ -27,11 +27,18 @@ The text contains "wins", so old clients show it like other wins. A flag always 
 
 ## CHESS_CLOCK
 
-`CHESS_CLOCK|whiteMs|blackMs|running|baseSec|incSec`
+`CHESS_CLOCK|whiteMs|blackMs|running|baseSec|incSec[|graceMs]`
 
 - `whiteMs`, `blackMs`: remaining milliseconds at the moment the packet was built, never negative.
 - `running`: `WHITE`, `BLACK`, or `-` when no clock runs (before both first moves, and after the game ends).
 - `baseSec`, `incSec`: the time control, e.g. `300|3` for 5+3.
+- `graceMs`: optional sixth field with milliseconds left before the running side begins losing time. The grace server includes it on every clock packet, with zero when absent or frozen. A five-field packet from an older server means zero grace.
+
+After an accepted capture (including en passant) or a move giving check, the opponent receives a two-second delay before their clock counts down. Quiet moves grant zero delay. This applies equally to both sides regardless of animation settings. Existing first-move rules still apply.
+
+A move made during the delay consumes no clock time. The normal increment still applies after a running turn. Unused delay is discarded on a move, and the next turn receives a fresh delay only if that move captures or gives check. State resends and spectator joins report the remaining delay without restarting it. Ending a game freezes its clock with zero remaining delay.
+
+New clients subtract elapsed time only after the reported grace is exhausted. Older clock clients can ignore the additional field and remain protocol-compatible, but their displayed countdown can temporarily run ahead during grace until the next server update. The server enforces the actual flag time.
 
 It is sent only for timed games and only to clock-capable transports (players and spectators):
 

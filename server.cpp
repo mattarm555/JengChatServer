@@ -131,6 +131,11 @@ struct Client {
     deque<pair<string,string>> hubResults;
     deque<chrono::steady_clock::time_point> hubCommands;
     bool recoveryCapable=false;
+    // Lounge presence relay (lounge.h): probed, lounge on screen, last canonical position, rate limits.
+    bool loungeCapable=false, loungeIn=false;
+    string loungePosition;
+    float loungeTokens=4.0f;
+    chrono::steady_clock::time_point loungeTokensAt{}, loungeEmoteAt{};
     string sessionHash, pendingResume;
     std::chrono::steady_clock::time_point lastReceive=std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPing=std::chrono::steady_clock::now();
@@ -9058,10 +9063,12 @@ void handleLegacyCommand(Client& client, const string& line) {
 // ============================================================
 
 #include "hub.h"
+#include "lounge.h"
 
 void disconnectClient(int index) {
     Socket socket = clients[index].socket;
     string name = clients[index].name;
+    lounge::leave(clients[index]);
 
     // If this user was the target of a pending challenge,
     // tell the challenger that it is gone.
@@ -9565,6 +9572,7 @@ namespace {
         // Unknown CLIENT_CAPS are safely ignored by beta 3. Only advertise hub
         // packets to clients that probe, so legacy chat never displays wire IDs.
         if(line=="CLIENT_CAPS|hub-v1"){sendPacket(c.socket,"HUB_CAPS","hub-v1");return;}
+        if(line=="CLIENT_CAPS|lounge-v1"){c.loungeCapable=true;sendPacket(c.socket,"LOUNGE_CAPS","lounge-v1");return;}
         if(line=="CLIENT_CAPS|resume-v1") {c.recoveryCapable=true;return;}
         if(line=="SESSION_START|" && c.recoveryCapable) {
             if(!c.sessionHash.empty())return;
@@ -9753,6 +9761,7 @@ int main(int argc, char** argv) {
                         string oldName = c.name;
                         sessions.revokeAccount(oldName);c.sessionHash.clear();sendPacket(c.socket,"SESSION_REVOKED","");
                         c.name = result.username;
+                        lounge::renamed(c, oldName);
                         sendPacket(c.socket, "ACCOUNT_USERNAME", c.name);
                         // Poker seats keep a name snapshot for packet records.
                         // Keep it in sync when an account changes its name.
@@ -9820,6 +9829,7 @@ int main(int argc, char** argv) {
                 if (c.name.empty()) authenticate(c, line, *accounts);
                 else if(line.rfind("CLIENT_CAPS|",0)==0 || line.rfind("SESSION_",0)==0 || line=="PING|" || line=="PONG|") handleRecovery(c,line);
                 else if (line.rfind("ACCOUNT_", 0) == 0) handleAccountCommand(c, line, *accounts);
+                else if (line.rfind("LOUNGE_", 0) == 0) lounge::handle(c, line); // ephemeral relay: no READY
                 else { handleCommand(c, line); sendReady(c.socket); }
                 OPENSSL_cleanse(line.data(), line.size());
                 if(!c.pendingResume.empty() || c.closeAfterFlush)break;
